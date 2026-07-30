@@ -400,6 +400,55 @@ h3 {
   font-size: 12px;
 }
 
+/* Folder tabs, the way Telegram does them: one scrolling row, never wrapping,
+   so a narrow rail can't turn the filter into three lines of chrome. */
+.folders {
+  display: flex;
+  gap: var(--s1);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  padding-bottom: 2px;
+  margin: 0 calc(-1 * var(--s1));
+}
+.folders::-webkit-scrollbar {
+  display: none;
+}
+.folder {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  height: 26px;
+  padding: 0 var(--s2);
+  border-radius: var(--r-sm);
+  color: var(--text-faint);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  border-bottom: 2px solid transparent;
+  transition: color var(--dur-fast) var(--ease),
+    border-color var(--dur-fast) var(--ease);
+}
+.folder:hover {
+  color: var(--text);
+}
+.folder[aria-selected="true"] {
+  color: var(--amber);
+  border-bottom-color: var(--amber);
+}
+.folder .count-pill {
+  background: transparent;
+  border: 1px solid var(--line);
+  font-size: 10px;
+  height: 16px;
+  min-width: 16px;
+}
+.folder[aria-selected="true"] .count-pill {
+  border-color: var(--amber-dim);
+  color: var(--amber);
+}
+
 /* Category heading inside the rail. Sticky so the group a channel belongs to
    stays visible while scrolling a long list. */
 .rail-group {
@@ -427,7 +476,8 @@ h3 {
    headings have nothing to label. */
 @media (max-width: 880px) {
   .rail-head .search,
-  .rail-group {
+  .rail-group,
+  .folders {
     display: none;
   }
 }
@@ -880,10 +930,16 @@ output.mono {
 
 .manifest-viewport {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
   position: relative;
-  contain: strict;
+  /* `layout paint`, NOT `strict`. `strict` adds size containment, which makes
+     this element size itself as though it had no contents — combined with the
+     absolutely-positioned rows inside, that left the browser treating every
+     row as off-screen and painting none of them. The isolation benefit comes
+     from layout+paint anyway. */
+  contain: layout paint;
 }
 .manifest-canvas {
   position: relative;
@@ -898,7 +954,10 @@ output.mono {
   border-bottom: 1px solid var(--ink-850);
   color: var(--text-dim);
   transition: background var(--dur-fast) linear;
-  content-visibility: auto;
+  /* No `content-visibility: auto` here. It is redundant under virtualization
+     (only the visible window is ever in the DOM) and it actively broke
+     rendering: rows were mounted and positioned correctly but their contents
+     were skipped, so the list looked empty while the counts said otherwise. */
 }
 .media-row:hover {
   background: var(--ink-850);

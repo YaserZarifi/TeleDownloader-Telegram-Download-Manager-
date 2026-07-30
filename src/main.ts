@@ -20,6 +20,7 @@ import "./styles.css";
 import type {
   AuthState,
   ChannelInfo,
+  ChatKind,
   Job,
   JobState,
   ProgressBatch,
@@ -46,6 +47,9 @@ const jobs = new Map<string, Job>();
 let channels: ChannelInfo[] = [];
 /** Lower-cased rail filter, applied to title and @username. */
 let railQuery = "";
+/** Active folder tab. "all" shows every chat, grouped by kind. */
+let railFolder: ChatKind | "all" = "all";
+let railFolderStrip: HTMLElement | null = null;
 /** Which channel the browser is showing, so the rail can survive re-renders. */
 let selectedChannelId: number | null = null;
 let settings: Settings | null = null;
@@ -191,11 +195,13 @@ async function mountShell(auth: Extract<AuthState, { stage: "ready" }>): Promise
     title: "Drag to resize",
   });
 
+  // Telegram-style folder tabs. A horizontally scrolling strip rather than a
+  // wrapping row, so a narrow rail never turns into three lines of chrome.
+  const folderStrip = el("div.folders", { role: "tablist", "aria-label": "Chat folders" });
+  railFolderStrip = folderStrip;
+
   const rail = el("nav.rail", {}, [
-    el("div.rail-head", {}, [
-      el("div.eyebrow.rail-title", {}, "Chats"),
-      railSearchBox,
-    ]),
+    el("div.rail-head", {}, [railSearchBox, folderStrip]),
     railList,
     el("div.rail-foot", {}, [addBtn]),
     resizer,
@@ -341,7 +347,42 @@ async function loadChannels(host: HTMLElement): Promise<void> {
     return;
   }
   channels = list;
+  if (railFolderStrip) renderFolders(railFolderStrip);
   renderChannels(host);
+}
+
+/** Folder order. Saved leads because it is the account's own file store. */
+const FOLDERS: Array<{ id: ChatKind | "all"; label: string }> = [
+  { id: "all", label: "All" },
+  { id: "saved", label: "Saved" },
+  { id: "channel", label: "Channels" },
+  { id: "group", label: "Groups" },
+  { id: "bot", label: "Bots" },
+  { id: "person", label: "People" },
+];
+
+function renderFolders(host: HTMLElement): void {
+  host.replaceChildren();
+  for (const f of FOLDERS) {
+    const n = f.id === "all" ? channels.length : channels.filter((c) => c.kind === f.id).length;
+    // An empty folder is noise — Telegram hides them too. "All" always shows.
+    if (n === 0 && f.id !== "all") continue;
+
+    const tab = el("button.folder", {
+      type: "button",
+      role: "tab",
+      "aria-selected": String(railFolder === f.id),
+    }, [
+      el("span", {}, f.label),
+      el("span.count-pill", {}, String(n)),
+    ]);
+    tab.addEventListener("click", () => {
+      railFolder = f.id;
+      renderFolders(host);
+      renderChannels(must(".rail-scroll"));
+    });
+    host.append(tab);
+  }
 }
 
 function renderChannels(host: HTMLElement): void {
@@ -349,40 +390,46 @@ function renderChannels(host: HTMLElement): void {
 
   if (!channels.length) {
     host.append(
-      el("div.rail-empty", {}, "No channels yet. Use “Add channel” to open one by @username.")
+      el("div.rail-empty", {}, "No chats yet. Use “Add channel” to open one by @username.")
     );
     return;
   }
 
-  const matches = railQuery
-    ? channels.filter(
-        (c) =>
-          c.title.toLowerCase().includes(railQuery) ||
-          (c.username ?? "").toLowerCase().includes(railQuery)
-      )
-    : channels;
+  const matches = channels
+    .filter((c) => railFolder === "all" || c.kind === railFolder)
+    .filter(
+      (c) =>
+        !railQuery ||
+        c.title.toLowerCase().includes(railQuery) ||
+        (c.username ?? "").toLowerCase().includes(railQuery)
+    );
 
   if (!matches.length) {
-    host.append(el("div.rail-empty", {}, `No channel matches “${railQuery}”.`));
+    host.append(
+      el(
+        "div.rail-empty",
+        {},
+        railQuery ? `No chat matches “${railQuery}”.` : "Nothing in this folder."
+      )
+    );
     return;
   }
 
-  // Categories come from Telegram's own classification rather than an invented
-  // taxonomy. Saved Messages leads because it is the account's own file store;
-  // channels are curated feeds; groups are where files get shared informally.
-  const groups: Array<[string, ChannelInfo[]]> = [
-    ["Saved", matches.filter((c) => c.kind === "saved")],
-    ["Channels", matches.filter((c) => c.kind === "channel")],
-    ["Groups", matches.filter((c) => c.kind === "group")],
-    ["Bots", matches.filter((c) => c.kind === "bot")],
-    ["People", matches.filter((c) => c.kind === "person")],
-  ];
+  // Inside a specific folder the rows are already homogeneous, so the group
+  // headings would just repeat the selected tab. They only earn their place
+  // in "All".
+  if (railFolder !== "all") {
+    renderChannelRows(host, matches);
+    return;
+  }
 
-  for (const [label, list] of groups) {
+  for (const f of FOLDERS) {
+    if (f.id === "all") continue;
+    const list = matches.filter((c) => c.kind === f.id);
     if (!list.length) continue;
     host.append(
       el("div.rail-group", {}, [
-        el("span.eyebrow", {}, label),
+        el("span.eyebrow", {}, f.label),
         el("span.count-pill", {}, String(list.length)),
       ])
     );
@@ -592,8 +639,11 @@ function promptChannel(host: HTMLElement): void {
       // Move an already-listed channel to the top rather than duplicating it,
       // and clear any filter that would hide the thing just added.
       channels = [ch, ...channels.filter((c) => c.id !== ch.id)];
+      // Clear any filter or folder that would hide the thing just added.
       railQuery = "";
+      railFolder = "all";
       selectedChannelId = ch.id;
+      if (railFolderStrip) renderFolders(railFolderStrip);
       renderChannels(host);
       browser?.setChannel(ch);
       browser?.setJobStates(jobStateIndex());
