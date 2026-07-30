@@ -853,12 +853,13 @@ export function createBrowser(opts: {
       r.vSelected = sel;
       r.node.dataset.selected = String(sel);
       r.node.setAttribute("aria-selected", String(sel));
-      // paint() is the *only* writer of `.checked`, which is what keeps a
-      // recycled row from carrying a stale tick: `vSelected` and the DOM are
-      // written together or not at all. That invariant is also why the click
-      // handler cancels the browser's own toggle — see onClick.
-      r.check.checked = sel;
     }
+    // Written every paint, deliberately OUTSIDE the guard: the browser toggles
+    // a clicked box natively before the click event even dispatches, so the
+    // DOM can disagree with `vSelected` while the cache says nothing changed.
+    // An unconditional boolean property write is free; a guard here is how the
+    // box once stayed empty on a selected tile.
+    r.check.checked = sel;
   }
 
   /* ---------- tiles ------------------------------------------------------- */
@@ -1019,10 +1020,10 @@ export function createBrowser(opts: {
       t.vSelected = sel;
       t.node.dataset.selected = String(sel);
       t.node.setAttribute("aria-selected", String(sel));
-      // As in paint(): the single writer of `.checked`. See onClick for why the
-      // browser's own toggle has to be cancelled.
-      t.check.checked = sel;
     }
+    // Unconditional for the same reason as in paint(): the native pre-dispatch
+    // toggle can leave the DOM out of step with the cache.
+    t.check.checked = sel;
   }
 
   /* ---------- render ------------------------------------------------------ */
@@ -1408,11 +1409,12 @@ export function createBrowser(opts: {
     // does not escape the grid to any ancestor listener.
     if (e.target instanceof Element && e.target.closest("[data-check]")) {
       e.stopPropagation();
-      // Cancels the browser's own toggle so paint() stays the single writer of
-      // `.checked`. Without this a shift-click that leaves a row selected would
-      // desync forever: the box would have flipped itself off, while paint()
-      // compares against `vSelected`, sees no change, and never writes it back.
-      e.preventDefault();
+      // NO preventDefault here. Cancelling a checkbox click makes the browser
+      // revert the box's checkedness *after* this handler returns — which
+      // silently undid the write render() makes below, leaving a selected tile
+      // with an empty box. The native toggle instead lands before this event
+      // dispatches, and paint()'s unconditional `.checked` write settles the
+      // final value; whatever the browser did first no longer matters.
       toggleAt(index, e.shiftKey);
       syncChrome();
       render();

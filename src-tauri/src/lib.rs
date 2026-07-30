@@ -90,10 +90,20 @@ async fn probe(tg: &Arc<Telegram>) -> anyhow::Result<()> {
         );
         match telegram::channel::list_media(&client, peer, 0, 20, MediaFilter::All).await {
             Ok(page) => {
+                let with_thumb = page.items.iter().filter(|i| i.thumb.is_some()).count();
+                eprintln!(
+                    "[telewire] probe:     thumbs {}/{}",
+                    with_thumb,
+                    page.items.len()
+                );
                 for item in page.items.iter().take(3) {
                     eprintln!(
-                        "[telewire] probe:     {:?} {} ({} bytes) mime={}",
-                        item.kind, item.name, item.size, item.mime
+                        "[telewire] probe:     {:?} {} ({} bytes) mime={} thumb={}",
+                        item.kind,
+                        item.name,
+                        item.size,
+                        item.mime,
+                        item.thumb.as_ref().map(|t| t.len()).unwrap_or(0)
                     );
                 }
             }

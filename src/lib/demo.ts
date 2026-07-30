@@ -617,9 +617,26 @@ function itemAt(channelId: number, index: number): MediaItem {
     size,
     date,
     duration,
-    // Fixtures carry no preview bytes; the grid falls back to its glyph.
-    thumb: null,
+    // Photos and videos get a tiny generated SVG plate, mirroring the real
+    // backend, where the inline preview ships with the message for exactly
+    // those kinds. Documents/audio stay null and exercise the glyph fallback.
+    thumb: kind === "photo" || kind === "video" ? thumbFor(rnd, kind) : null,
   };
+}
+
+/** A deterministic blurry-gradient placeholder, ~200 bytes, shaped like the
+ *  real stripped previews: soft, low-detail, unique per item. */
+function thumbFor(rnd: () => number, kind: MediaKind): string {
+  const h1 = Math.round(rnd() * 360);
+  const h2 = (h1 + 40 + Math.round(rnd() * 80)) % 360;
+  const l = kind === "photo" ? 45 : 30;
+  const svg =
+    `<svg xmlns='http://www.w3.org/2000/svg' width='32' height='24'>` +
+    `<defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'>` +
+    `<stop offset='0' stop-color='hsl(${h1},55%,${l}%)'/>` +
+    `<stop offset='1' stop-color='hsl(${h2},45%,${Math.max(12, l - 18)}%)'/>` +
+    `</linearGradient></defs><rect width='32' height='24' fill='url(%23g)'/></svg>`;
+  return `data:image/svg+xml,${svg.replace(/</g, "%3C").replace(/>/g, "%3E").replace(/#/g, "%23")}`;
 }
 
 /** First index whose message id is strictly below `offsetId` (ids descend). */
