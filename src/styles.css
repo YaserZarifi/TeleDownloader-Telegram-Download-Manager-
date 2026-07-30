@@ -1888,3 +1888,301 @@ output.mono {
   border-color: var(--cyan-dim);
   color: var(--cyan-hi);
 }
+
+/* ---------- 22. Grid view (thumbnail tiles) ----------------------------- */
+/* The same virtualizer as §11, not a second one: .manifest-viewport still
+   scrolls, .manifest-canvas is still sized to the whole set, and tiles are
+   still absolutely positioned and recycled. Only the slot maths differs — a
+   band holds `columns` tiles instead of one row — and browser.ts owns it,
+   because `columns` has to be a number the scroll path can do arithmetic with.
+   That is also why the grid's inset and gutter are applied as inline offsets
+   rather than as padding and `gap` here: CSS the JS cannot read would put the
+   canvas height and the tile positions out of step.
+
+   Everything below is additive. The tile reuses .cbx, .m-check, .m-status,
+   .btn-icon and .skel-bar from §7/§18/§19 rather than restating them, so a
+   checkbox, a status word or a shimmer looks identical in both modes.
+
+   Motion: the only transitions here are hover/press fades, which §17 already
+   collapses, and the skeleton sweep, which §18 already flattens. */
+
+:root {
+  /* Read back by browser.ts as TILE_H and the thumb box height. Same contract
+     as --row-h: every tile offset and the canvas height are derived from these
+     numbers, so a mismatch shows up as tiles drifting out of their band. */
+  --tile-h: 180px;
+  --tile-thumb-h: 118px;
+}
+
+/* ---- the toolbar toggle ---- */
+
+/* Deliberately shaped like .tabs (§8) — it sits beside them and is the same
+   kind of control: a small set of mutually exclusive choices, all visible. */
+.viewmode {
+  display: flex;
+  gap: var(--s1);
+  padding: var(--s1);
+  flex: none;
+  background: var(--ink-950);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+}
+.vm-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--r-sm);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-faint);
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+.vm-btn:hover {
+  color: var(--text);
+}
+/* Cyan, not amber: this is "the mode you are in", a steady-state signal. Amber
+   is reserved for bytes actually moving and would read as activity here. */
+.vm-btn[aria-pressed="true"] {
+  background: var(--ink-800);
+  color: var(--cyan);
+}
+
+/* ---- the grid's head ---- */
+
+/* A grid has no columns to name, so this bar carries only select-all. Set like
+   .manifest-head so switching modes does not change the height or the voice of
+   the strip under the toolbar. */
+.grid-head {
+  display: flex;
+  align-items: center;
+  height: 30px;
+  flex: none;
+  padding: 0 var(--s4);
+  border-bottom: 1px solid var(--line);
+  background: var(--ink-950);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+.grid-head-check {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s2);
+  cursor: pointer;
+}
+.grid-head-check:hover {
+  color: var(--text-dim);
+}
+
+/* ---- the tile ---- */
+
+.media-tile {
+  /* Scrim for the controls that sit over a photograph. Declared twice so an
+     engine without color-mix still gets the same value rather than nothing;
+     the second declaration wins wherever it is understood. */
+  --tile-scrim: #05090fcc;
+  --tile-scrim: color-mix(in srgb, var(--ink-1000) 80%, transparent);
+
+  position: absolute;
+  top: 0;
+  left: 0;
+  /* Fixed height, always. A tile whose height depended on its thumbnail would
+     resize as each image decoded and shove every band below it — the
+     virtualizer's index-to-position map assumes that never happens. */
+  height: var(--tile-h);
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--ink-850);
+  overflow: hidden;
+  transition: background var(--dur-fast) var(--ease),
+    border-color var(--dur-fast) var(--ease);
+}
+.media-tile:hover {
+  background: var(--ink-800);
+  border-color: var(--line-strong);
+}
+/* Reads the same as .media-row[data-selected]: a cyan edge on a raised
+   surface. The row marks its leading edge because it has one; a tile has four,
+   so the whole border carries it. */
+.media-tile[data-selected="true"] {
+  background: var(--ink-800);
+  border-color: var(--cyan);
+  box-shadow: inset 0 0 0 1px var(--cyan);
+}
+/* Inset, like the row's: .manifest-viewport has paint containment, which would
+   clip an outer ring on the tiles against either edge. */
+.media-tile:focus-visible {
+  box-shadow: var(--focus) inset;
+}
+
+.tile-thumb {
+  position: relative;
+  flex: none;
+  height: var(--tile-thumb-h);
+  display: grid;
+  place-items: center;
+  background: var(--ink-950);
+  overflow: hidden;
+}
+
+/* The image covers the plate; the plate is never removed, so it is also what
+   shows through when a thumbnail is absent or fails to decode. */
+.tile-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  /* Thumbnails are a few dozen pixels and get scaled up several times over.
+     `cover` fills the frame whatever the source aspect ratio, and `auto`
+     resampling keeps that upscale smooth — nearest-neighbour on a stripped
+     JPEG looks like a decoding fault, not a design choice. */
+  object-fit: cover;
+  image-rendering: auto;
+}
+
+.tile-glyph {
+  display: grid;
+  place-items: center;
+  width: 46px;
+  height: 46px;
+  border-radius: var(--r-md);
+  background: var(--ink-800);
+  color: var(--text-dim);
+}
+/* Same kind-to-colour mapping as .m-kind in §11, so a file's type reads the
+   same whichever mode it is in. */
+.media-tile[data-kind="video"] .tile-glyph {
+  color: var(--violet);
+}
+.media-tile[data-kind="audio"] .tile-glyph {
+  color: var(--cyan);
+}
+.media-tile[data-kind="photo"] .tile-glyph {
+  color: var(--amber);
+}
+
+/* The checkbox is always visible — same reasoning as §19, a selection control
+   that only appears on hover is not discoverable — and gets a scrim because
+   unlike in the list it can land on a bright photograph. */
+.media-tile .m-check {
+  position: absolute;
+  top: var(--s1);
+  left: var(--s1);
+  width: 26px;
+  height: 26px;
+  align-self: auto;
+  border-radius: var(--r-sm);
+  background: var(--tile-scrim);
+}
+/* Mirrors §11's row action: hidden with opacity, never display:none, so it
+   stays reachable by keyboard and by an assistive pointer. */
+.media-tile .tile-dl {
+  position: absolute;
+  top: var(--s1);
+  right: var(--s1);
+  width: 26px;
+  height: 26px;
+  background: var(--tile-scrim);
+  color: var(--text);
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease);
+}
+.media-tile:hover .tile-dl,
+.media-tile:focus-within .tile-dl,
+.media-tile .tile-dl:focus-visible {
+  opacity: 1;
+}
+
+/* Inherits its type and its per-state colour from .m-status (§11); this only
+   places it and keeps it legible over an image. `display` is restated because
+   §16 drops the *column* .m-status below 720px — the tile has no columns to
+   run out of, and losing the transfer state there would be a real loss. */
+.media-tile .tile-status {
+  display: block;
+  position: absolute;
+  left: var(--s1);
+  bottom: var(--s1);
+  max-width: calc(100% - var(--s2));
+  padding: 1px 5px;
+  border-radius: var(--r-sm);
+  background: var(--tile-scrim);
+}
+/* No job state means no chip at all, rather than an empty plate. */
+.media-tile .tile-status:empty {
+  display: none;
+}
+
+.tile-meta {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: var(--s2) var(--s3);
+}
+
+.tile-name {
+  /* Mono, like .m-name: a filename is data, not a label. */
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 15px;
+  color: var(--text);
+  /* Exactly two lines, reserved whether or not the name needs them, so the
+     size below sits on the same baseline in every tile. `break-all` because
+     filenames have no spaces to wrap at, and one long token would otherwise
+     overflow a single line and waste the second. */
+  height: 30px;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  word-break: break-all;
+}
+
+.tile-size {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+}
+
+/* ---- skeletons (§18, in tile form) ---- */
+
+/* The first-page placeholder. Laid out by auto-fill rather than by the
+   virtualizer: nothing scrolls yet, so there is no window to compute. The
+   180px minimum is the same target width browser.ts uses for `columns`, so
+   the placeholder grid and the real one agree on the column count. */
+.skel-grid {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  align-content: start;
+  gap: var(--s3);
+  padding: var(--s4);
+}
+.skel-grid .skel-tile {
+  position: relative;
+}
+.skel-tile {
+  /* Not a tile — a hole where a tile will be: never hoverable or clickable. */
+  pointer-events: none;
+  background: var(--ink-850);
+}
+.skel-tile:hover {
+  background: var(--ink-850);
+  border-color: var(--line);
+}
+/* Fill the thumb box rather than floating a thin bar in the middle of it. */
+.skel-tile .tile-thumb .skel-bar {
+  height: 100%;
+  border-radius: 0;
+}
+.skel-tile .tile-name .skel-bar {
+  margin-top: 3px;
+}

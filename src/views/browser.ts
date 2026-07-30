@@ -8,6 +8,15 @@
  * an order of magnitude cheaper than creating/destroying them per frame, and
  * it keeps GC out of the scroll path.
  *
+ * The grid view is the same virtualizer with one extra term. Both modes map a
+ * view index to a slot: the list puts index i at row i, the grid puts it in
+ * band floor(i / columns), column i % columns. Every piece of geometry —
+ * canvas height, the mounted window, scroll-into-view, the near-bottom pager —
+ * goes through `topOf` / `contentH` / `bands`, which are written once against
+ * `columns` and read 1 in list mode. Tiles get their own pool but obey the
+ * same acquire / release / paint contract, so a scroll frame in grid mode
+ * allocates nothing either.
+ *
  * Everything Telegram sends us (titles, filenames) is attacker-controlled and
  * is only ever written through `textContent` / the `text:` attribute. `html:`
  * is reserved for the icon SVG strings we ship ourselves.
@@ -31,6 +40,48 @@ const NEAR_BOTTOM = 600;
 /** Filenames are truncated in the middle so the extension survives; the CSS
  *  ellipsis alone would eat it. */
 const NAME_MAX = 80;
+
+/* ---------- grid geometry ------------------------------------------------ */
+
+export type ViewMode = "list" | "grid";
+
+/** Must match `--tile-h` in §22, for the same reason ROW_H must match
+ *  `--row-h`: every tile offset and the canvas height are computed from it. */
+const TILE_H = 180;
+/** Target tile width. Tiles stretch to divide the viewport evenly, so this is
+ *  the *minimum* a column may be, not the width one ends up with. */
+const TILE_MIN_W = 180;
+/** Gutter between tiles (`--s3`) and the canvas inset (`--s4`). Both live here
+ *  rather than in CSS padding because the slot maths needs them as numbers,
+ *  and a padded canvas would put the two out of step. */
+const TILE_GAP = 12;
+const GRID_PAD = 16;
+/** Bands (not tiles) kept mounted above and below the window. A band is
+ *  `columns` tiles, so 2 already means up to ~20 spare nodes on a wide window
+ *  — the list's 8 rows of overscan would be 60+ image decodes. */
+const TILE_OVERSCAN = 2;
+/** Roughly two clamped lines of 11.5px mono in a 180px tile. The CSS clamp is
+ *  the real backstop; this only makes sure the middle-ellipsis happens before
+ *  the clamp does, because the clamp truncates the *end* and would eat the
+ *  extension. */
+const TILE_NAME_MAX = 42;
+
+const VIEW_MODE_KEY = "telewire.viewMode";
+
+const VIEW_MODES: ReadonlyArray<{ id: ViewMode; label: string; glyph: IconName }> = [
+  // There is no grid glyph in the icon set and icons.ts is not ours to grow
+  // here, so the two closest existing shapes stand in: `inbox` reads as
+  // stacked horizontal lines, `image` as a framed picture. Neither is left to
+  // carry the meaning alone — both buttons have a visible tooltip and a label.
+  { id: "list", label: "List view", glyph: "inbox" },
+  { id: "grid", label: "Grid view", glyph: "image" },
+];
+
+/** Anything but an exact "grid" falls back to the list, so a corrupted or
+ *  hand-edited value degrades to the mode that works at any window size. */
+function loadViewMode(): ViewMode {
+  return localStorage.getItem(VIEW_MODE_KEY) === "grid" ? "grid" : "list";
+}
 
 /** Placeholder rows drawn while page 1 is in flight. Twelve covers a ~530px
  *  viewport; the container clips whatever falls past it, so this never has to
@@ -85,6 +136,32 @@ interface Row {
   vSelected: boolean;
 }
 
+/** The grid's equivalent of `Row`. Same contract — cached values, compared
+ *  before writing — with two extra cursors: `vGeom` catches a column-count
+ *  change (which moves every tile without changing any index), and `vSet`
+ *  catches a change to `view.length`, which every tile reports as its
+ *  `aria-setsize` even when its own position is unchanged. */
+interface Tile {
+  node: HTMLElement;
+  check: HTMLInputElement;
+  glyph: HTMLElement;
+  img: HTMLImageElement;
+  name: HTMLElement;
+  size: HTMLElement;
+  status: HTMLElement;
+  dl: HTMLElement;
+  vIndex: number;
+  vGeom: number;
+  vSet: number;
+  vId: number;
+  vKind: string;
+  vName: string;
+  vSize: number;
+  vThumb: string | null;
+  vStatus: string;
+  vSelected: boolean;
+}
+
 const msgOf = (e: unknown): string =>
   e instanceof Error && e.message ? e.message : "Unexpected backend failure";
 
@@ -134,9 +211,26 @@ export function createBrowser(opts: {
 
   /** Cached so neither the scroll handler nor the render loop reads layout. */
   let viewportH = 0;
+  /** Same, for the grid: `columns` is derived from this, never from an
+   *  offsetWidth read inside the scroll path. */
+  let viewportW = 0;
+
+  let mode: ViewMode = loadViewMode();
+  /** Tiles per band. Held at 1 in list mode so every shared geometry helper
+   *  below collapses to the list's original maths instead of branching. */
+  let columns = 1;
+  /** Pixel width of one tile: the leftover after the gutters, divided evenly,
+   *  so the grid fills the viewport instead of leaving a ragged right margin. */
+  let tileW = TILE_MIN_W;
+  /** Bumped whenever `columns` or `tileW` moves. Mounted tiles keep their view
+   *  index across a resize, so this is the only signal that their cached
+   *  position is stale. */
+  let geomV = 0;
 
   const mounted = new Map<number, Row>(); // view index -> live row
   const pool: Row[] = [];
+  const tiles = new Map<number, Tile>(); // view index -> live tile
+  const tilePool: Tile[] = [];
 
   /* ---------- toolbar ---------------------------------------------------- */
 
@@ -178,6 +272,30 @@ export function createBrowser(opts: {
     tabsEl.append(tab);
   }
 
+  /* Two toggle buttons rather than a tab pair: switching view mode reveals
+     nothing new, it re-lays-out the same files, so the right ARIA is
+     `aria-pressed` on buttons and not `aria-selected` on tabs. Both carry a
+     label *and* a title — the glyphs are borrowed (see VIEW_MODES) and must
+     not be asked to carry the meaning by themselves. */
+  const modeBtns = new Map<ViewMode, HTMLElement>();
+  const viewModeEl = el<"div">("div.viewmode", {
+    role: "group",
+    "aria-label": "View mode",
+  });
+  for (const m of VIEW_MODES) {
+    const btn = el<"button">("button.vm-btn", {
+      type: "button",
+      "data-mode": m.id,
+      "aria-label": m.label,
+      title: m.label,
+      // el() drops `false`, so ARIA booleans go in as strings.
+      "aria-pressed": String(m.id === mode),
+      html: icon(m.glyph, 15), // ours, not Telegram's
+    });
+    modeBtns.set(m.id, btn);
+    viewModeEl.append(btn);
+  }
+
   const dlLabel = el<"span">("span", { text: "Download" });
   const dlBtn = el<"button">("button.btn.btn-primary", { type: "button", hidden: true }, [
     el<"span">("span", { html: icon("download", 15) }),
@@ -188,6 +306,7 @@ export function createBrowser(opts: {
     el<"div">("div.toolbar-title", {}, [titleEl, subEl]),
     searchBox,
     tabsEl,
+    viewModeEl,
     dlBtn,
   ]);
 
@@ -207,8 +326,9 @@ export function createBrowser(opts: {
      eight children in row order. The three columns the responsive rules drop
      (`.m-seq`, `.m-date`, `.m-status`) carry those classes here too, otherwise
      the head would keep eight children in a five-column grid below 720px. */
+  const headCheck = el<"span">("span.m-check", {}, [selectAll]);
   const head = el<"div">("div.manifest-head", {}, [
-    el<"span">("span.m-check", {}, [selectAll]),
+    headCheck,
     el<"span">("span.m-seq", { text: "#" }),
     el<"span">("span", { "aria-hidden": "true" }),
     el<"span">("span", { text: "Name" }),
@@ -217,6 +337,17 @@ export function createBrowser(opts: {
     el<"span">("span.m-status", { text: "Status" }),
     el<"span">("span", { "aria-hidden": "true" }),
   ]);
+
+  /* A grid of thumbnails has no columns to label, but select-all still has to
+     be reachable, so grid mode gets a one-line head of its own. `selectAll` is
+     a single node shared by both heads — whichever body is being built claims
+     it (see syncBody), which is the only way it can be neither duplicated nor
+     silently missing. Wrapping it in a real <label> makes the word a click
+     target and fires exactly the same `change` the box does. */
+  const gridHeadCheck = el<"label">("label.grid-head-check", {}, [
+    el<"span">("span", { text: "Select all" }),
+  ]);
+  const gridHead = el<"div">("div.grid-head", {}, [gridHeadCheck]);
 
   const canvas = el<"div">("div.manifest-canvas", { role: "rowgroup" });
   const viewport = el<"div">(
@@ -232,6 +363,7 @@ export function createBrowser(opts: {
     },
     [canvas]
   );
+  viewport.dataset.mode = mode;
 
   /* Sits under the toolbar while a scan runs. A scan walks *messages*, not
      files, so on a text-heavy chat there can be seconds of nothing; saying so
@@ -244,6 +376,66 @@ export function createBrowser(opts: {
 
   const root = el<"div">("div.main");
   root.append(toolbar, scanNote);
+
+  /* ---------- geometry ---------------------------------------------------- */
+  /* One index -> position map for both modes. The list is the degenerate case
+     of the grid at one column, so these five functions are written once and
+     the list simply never sees a `columns` above 1. */
+
+  /**
+   * Re-derives `columns` and `tileW` from the cached viewport width. Returns
+   * true when either moved, which is the caller's cue to bump `geomV` and
+   * repaint positions.
+   *
+   * `columns` is the largest n with `n * TILE_MIN_W + (n - 1) * TILE_GAP` still
+   * inside the content box — rearranged, `n <= (inner + GAP) / (MIN_W + GAP)`,
+   * because adding a column costs one tile *and* one gutter. Floor it, and
+   * never let it reach 0: a 100px-wide window still has to show something.
+   */
+  function syncGeometry(): boolean {
+    const inner = Math.max(0, viewportW - GRID_PAD * 2);
+    const cols =
+      mode === "grid"
+        ? Math.max(1, Math.floor((inner + TILE_GAP) / (TILE_MIN_W + TILE_GAP)))
+        : 1;
+    // The remainder is handed back to the tiles rather than left as a margin,
+    // so the grid always reaches both edges and tiles are >= TILE_MIN_W.
+    const w = mode === "grid" ? (inner - (cols - 1) * TILE_GAP) / cols : 0;
+    if (cols === columns && w === tileW) return false;
+    columns = cols;
+    tileW = w;
+    geomV++;
+    return true;
+  }
+
+  /** Vertical distance from one band of tiles (or one row) to the next. */
+  function stride(): number {
+    return mode === "grid" ? TILE_H + TILE_GAP : ROW_H;
+  }
+
+  /** How many stacked bands `count` items occupy. */
+  function bands(count: number): number {
+    return mode === "grid" ? Math.ceil(count / columns) : count;
+  }
+
+  /** Total scrollable content height for `count` items. The grid pads both
+   *  ends and has one gutter fewer than it has bands, which is why this is not
+   *  simply `bands * stride`. */
+  function contentH(count: number): number {
+    if (count <= 0) return 0;
+    if (mode !== "grid") return count * ROW_H;
+    return GRID_PAD * 2 + bands(count) * stride() - TILE_GAP;
+  }
+
+  function topOf(index: number): number {
+    return mode === "grid"
+      ? GRID_PAD + Math.floor(index / columns) * stride()
+      : index * ROW_H;
+  }
+
+  function leftOf(index: number): number {
+    return GRID_PAD + (index % columns) * (tileW + TILE_GAP);
+  }
 
   /* ---------- body swapping ---------------------------------------------- */
 
@@ -316,6 +508,24 @@ export function createBrowser(opts: {
     );
   }
 
+  /** The grid's placeholder, carrying `.media-tile` for the same reason
+   *  `skelRow` carries `.media-row`: it inherits the real tile's box, so the
+   *  swap for a real tile moves nothing. */
+  function skelTile(i: number): HTMLElement {
+    const w = SKELETON_W[i % SKELETON_W.length] ?? 70;
+    return el<"div">(
+      "div.media-tile.skel-tile",
+      { "aria-hidden": "true", style: `--skel-i:${i % 6}` },
+      [
+        el<"div">("div.tile-thumb", {}, [skelBar("100%")]),
+        el<"div">("div.tile-meta", {}, [
+          el<"span">("span.tile-name", {}, [skelBar(`${w}%`)]),
+          el<"span">("span.tile-size", {}, [skelBar("40%")]),
+        ]),
+      ]
+    );
+  }
+
   /** The first-page placeholder. Rendered under the real `.manifest-head` so
    *  the header does not appear late and shove the list down. */
   function skelList(): HTMLElement {
@@ -324,33 +534,58 @@ export function createBrowser(opts: {
     return list;
   }
 
+  /** Grid equivalent. Laid out in flow by `auto-fill`, not by the virtualizer:
+   *  nothing is scrollable yet, so there is no window to compute and no reason
+   *  to teach the placeholder about columns. */
+  function skelGrid(): HTMLElement {
+    const grid = el<"div">("div.skel-grid", { "aria-hidden": "true" });
+    for (let i = 0; i < SKELETON_ROWS; i++) grid.append(skelTile(i));
+    return grid;
+  }
+
   /** Built once and moved in and out of the canvas. These are chrome, not
-   *  data, so they never enter the row pool. */
+   *  data, so they never enter the row pool. Rebuilt when the mode changes —
+   *  a `.media-row` parked in a grid canvas would be a full-width bar across
+   *  the tiles. */
   let tail: HTMLElement[] | null = null;
+  let tailMode: ViewMode | null = null;
 
   /**
    * Sizes the canvas and parks the tail placeholders after the last real row.
    *
    * The canvas is the only thing giving the viewport a scroll range, so its
-   * height has to include the placeholders: rows hanging past
-   * `view.length * ROW_H` would be unreachable, and the scrollbar would jump
-   * the moment they were swapped for real rows. render() is untouched by this
-   * — it still only ever mounts pooled rows for indices in [0, view.length),
-   * and the tail nodes live outside `mounted` so recycling never sees them.
+   * height has to include the placeholders: rows hanging past the last real
+   * one would be unreachable, and the scrollbar would jump the moment they
+   * were swapped for real rows. render() is untouched by this — it still only
+   * ever mounts pooled rows for indices in [0, view.length), and the tail
+   * nodes live outside `mounted` so recycling never sees them.
+   *
+   * The placeholders take the slots straight after the last item, which in
+   * grid mode means they finish off the half-empty last band before starting a
+   * new one — exactly where the next files will land.
    */
   function syncTail(): void {
     const show = loading && view.length > 0 && !stalled;
-    if (show && !tail) {
-      tail = Array.from({ length: TAIL_SKELETONS }, (_, i) => skelRow(i));
+    if (show && (!tail || tailMode !== mode)) {
+      for (const node of tail ?? []) node.remove(); // wrong shape for this mode
+      tailMode = mode;
+      tail = Array.from({ length: TAIL_SKELETONS }, (_, i) =>
+        mode === "grid" ? skelTile(i) : skelRow(i)
+      );
     }
     const rows = tail ?? [];
-    canvas.style.height = `${(view.length + (show ? rows.length : 0)) * ROW_H}px`;
+    canvas.style.height = `${contentH(view.length + (show ? rows.length : 0))}px`;
     for (const [i, node] of rows.entries()) {
       if (!show) {
         node.remove();
         continue;
       }
-      node.style.top = `${(view.length + i) * ROW_H}px`;
+      const slot = view.length + i;
+      node.style.top = `${topOf(slot)}px`;
+      if (mode === "grid") {
+        node.style.left = `${leftOf(slot)}px`;
+        node.style.width = `${tileW}px`;
+      }
       if (node.parentNode !== canvas) canvas.append(node);
     }
   }
@@ -426,8 +661,9 @@ export function createBrowser(opts: {
       // Placeholder rows, not a spinner: the first page can take seconds, and
       // a shaped list tells the user what is coming and how it will be laid
       // out. The real head goes above them so it does not arrive late and
-      // push the whole list down.
-      setBody("loading", () => [head, skelList()]);
+      // push the whole list down. The key carries the mode because this body
+      // is one of the two that are drawn differently in each.
+      setBody(`loading:${mode}`, () => [claimHead(), shapedSkeleton()]);
       return;
     }
     if (stalled && items.length === 0) {
@@ -481,7 +717,23 @@ export function createBrowser(opts: {
       ]);
       return;
     }
-    setBody("list", () => [head, viewport]);
+    setBody(`view:${mode}`, () => [claimHead(), viewport]);
+  }
+
+  /** Moves the shared select-all box into the head this mode uses and returns
+   *  that head. Called from inside a `make()`, which is the one moment both
+   *  heads are detached and the move cannot be seen. */
+  function claimHead(): HTMLElement {
+    if (mode === "grid") {
+      gridHeadCheck.prepend(selectAll);
+      return gridHead;
+    }
+    headCheck.append(selectAll);
+    return head;
+  }
+
+  function shapedSkeleton(): HTMLElement {
+    return mode === "grid" ? skelGrid() : skelList();
   }
 
   /* ---------- rows ------------------------------------------------------- */
@@ -609,9 +861,174 @@ export function createBrowser(opts: {
     }
   }
 
+  /* ---------- tiles ------------------------------------------------------- */
+
+  /**
+   * One recycled tile.
+   *
+   * The glyph plate is always in the DOM, underneath the image rather than
+   * instead of it: it is the fallback for `thumb === null` *and* the fallback
+   * for a thumbnail that fails to decode, which costs one `error` listener
+   * instead of a second code path.
+   *
+   * `role="option"` inside a `listbox` viewport, not `row`/`gridcell`: what a
+   * tile is, is one selectable thing, and `aria-selected` is the state that
+   * actually matters here. The trade is that an option's children are
+   * presentational, so the per-tile download button is not separately exposed
+   * — which is why Enter on the focused tile enqueues it and Space toggles
+   * selection (see onKeyDown). Those are the keyboard paths, and they work
+   * whether or not the button is announced.
+   */
+  function makeTile(): Tile {
+    const check = el<"input">("input.cbx", { type: "checkbox", tabindex: "-1" });
+    const checkCell = el<"span">("span.m-check", { "data-check": "" }, [check]);
+    const glyph = el<"span">("span.tile-glyph");
+    const img = el<"img">("img.tile-img", {
+      alt: "", // decorative: the filename is right below it, in text
+      // Data URIs, so there is no network to defer — but the *decode* is real
+      // main-thread work, and both of these hand its scheduling to the engine.
+      loading: "lazy",
+      decoding: "async",
+      hidden: true,
+      draggable: "false",
+    });
+    img.addEventListener("error", () => {
+      // A malformed data URI would otherwise paint the engine's broken-image
+      // marker over the plate. Fall back to the glyph instead; paint() reverses
+      // this the moment a different thumbnail is assigned.
+      img.hidden = true;
+    });
+    const status = el<"span">("span.m-status.tile-status");
+    const dl = el<"button">("button.btn-icon.tile-dl", {
+      type: "button",
+      "data-dl": "",
+      html: icon("download", 14), // ours, not Telegram's
+    });
+    const thumb = el<"div">("div.tile-thumb", {}, [glyph, img, status, checkCell, dl]);
+    const name = el<"span">("span.tile-name");
+    const size = el<"span">("span.tile-size.mono");
+    const meta = el<"div">("div.tile-meta", {}, [name, size]);
+    const node = el<"div">(
+      "div.media-tile",
+      { role: "option", tabindex: "0", "data-selected": "false", "aria-selected": "false" },
+      [thumb, meta]
+    );
+    return {
+      node,
+      check,
+      glyph,
+      img,
+      name,
+      size,
+      status,
+      dl,
+      vIndex: -1,
+      vGeom: -1,
+      vSet: -1,
+      vId: -1,
+      vKind: "",
+      vName: "",
+      vSize: -1,
+      vThumb: "\u0000", // no data URI can equal this, so the first paint writes
+      vStatus: "\u0000",
+      vSelected: false,
+    };
+  }
+
+  function acquireTile(): Tile {
+    return tilePool.pop() ?? makeTile();
+  }
+
+  function releaseTile(t: Tile): void {
+    if (t.node.contains(document.activeElement)) viewport.focus();
+    t.node.remove();
+    // Deeper than the row pool: a wide window mounts `columns` tiles per band,
+    // so the working set is tens of nodes rather than the list's twenty-odd.
+    if (tilePool.length < 96) tilePool.push(t);
+  }
+
+  function paintTile(t: Tile, item: MediaItem, index: number): void {
+    // `vGeom` and not just `vIndex`: a resize changes every tile's position
+    // while leaving its index alone, so the index comparison alone would leave
+    // the whole grid painted for the previous column count.
+    if (t.vIndex !== index || t.vGeom !== geomV) {
+      t.vIndex = index;
+      t.vGeom = geomV;
+      t.node.style.top = `${topOf(index)}px`;
+      t.node.style.left = `${leftOf(index)}px`;
+      t.node.style.width = `${tileW}px`;
+      t.node.dataset.i = String(index);
+      t.node.setAttribute("aria-posinset", String(index + 1));
+    }
+    // Only a window of the list is ever in the DOM, so without setsize a
+    // screen reader reports "3 of 40" for a channel holding 40 000 files.
+    if (t.vSet !== view.length) {
+      t.vSet = view.length;
+      t.node.setAttribute("aria-setsize", String(view.length));
+    }
+    if (t.vId !== item.message_id) {
+      t.vId = item.message_id;
+      t.node.dataset.id = String(item.message_id);
+    }
+    if (t.vKind !== item.kind) {
+      t.vKind = item.kind;
+      t.node.dataset.kind = item.kind;
+      t.glyph.innerHTML = kindIcon(item.kind, 26); // ours, not Telegram's
+    }
+    if (t.vThumb !== item.thumb) {
+      t.vThumb = item.thumb;
+      if (item.thumb) {
+        // Assigned as a property, never interpolated into markup: this string
+        // came off the wire, and `img.src = …` parses it as a URL and nothing
+        // else. The plate stays behind it as the decode/failure fallback.
+        t.img.src = item.thumb;
+        t.img.hidden = false;
+      } else {
+        // removeAttribute, not `src = ""`: an empty src resolves against the
+        // document and fires a real request for the app shell.
+        t.img.removeAttribute("src");
+        t.img.hidden = true;
+      }
+    }
+    if (t.vName !== item.name) {
+      t.vName = item.name;
+      // Middle-ellipsized *before* the CSS clamp gets it: the clamp cuts the
+      // end, and the extension is the most useful part of a long filename.
+      t.name.textContent = ellipsize(item.name, TILE_NAME_MAX);
+      t.name.title = item.name;
+      t.dl.setAttribute("aria-label", `Download ${item.name}`);
+      t.dl.setAttribute("title", `Download ${item.name}`);
+      // setAttribute, never innerHTML — this string is Telegram's.
+      t.check.setAttribute("aria-label", `Select ${item.name}`);
+    }
+    if (t.vSize !== item.size) {
+      t.vSize = item.size;
+      t.size.textContent = bytes(item.size);
+    }
+    const st = stateOf(item);
+    if (t.vStatus !== st) {
+      t.vStatus = st;
+      // Empty text, not `hidden`: `.tile-status:empty` already collapses it,
+      // which keeps the show/hide rule in one place.
+      t.status.textContent = st;
+      if (st) t.status.dataset.s = st;
+      else delete t.status.dataset.s;
+    }
+    const sel = selected.has(item.message_id);
+    if (t.vSelected !== sel) {
+      t.vSelected = sel;
+      t.node.dataset.selected = String(sel);
+      t.node.setAttribute("aria-selected", String(sel));
+      // As in paint(): the single writer of `.checked`. See onClick for why the
+      // browser's own toggle has to be cancelled.
+      t.check.checked = sel;
+    }
+  }
+
+  /* ---------- render ------------------------------------------------------ */
+
   /** Mount exactly the window [first, last) and recycle everything else. */
-  function render(): void {
-    if (dead) return;
+  function renderList(): void {
     const top = viewport.scrollTop;
     const first = Math.max(0, Math.floor(top / ROW_H) - OVERSCAN);
     const last = Math.min(view.length, Math.ceil((top + viewportH) / ROW_H) + OVERSCAN);
@@ -635,13 +1052,85 @@ export function createBrowser(opts: {
     }
   }
 
+  /**
+   * The same window computation one band at a time.
+   *
+   * A band is `columns` tiles, so the first and last *indices* are the band
+   * bounds multiplied out. `- GRID_PAD` before dividing because band 0 starts
+   * one inset down, not at scrollTop 0; without it the window is off by one
+   * band as soon as the user scrolls past the top.
+   */
+  function renderGrid(): void {
+    const top = viewport.scrollTop;
+    const h = stride();
+    const bandCount = bands(view.length);
+    const firstBand = Math.max(0, Math.floor((top - GRID_PAD) / h) - TILE_OVERSCAN);
+    const lastBand = Math.min(
+      bandCount,
+      Math.ceil((top + viewportH - GRID_PAD) / h) + TILE_OVERSCAN
+    );
+    const first = firstBand * columns;
+    const last = Math.min(view.length, Math.max(first, lastBand * columns));
+
+    for (const [i, t] of tiles) {
+      if (i < first || i >= last) {
+        tiles.delete(i);
+        releaseTile(t);
+      }
+    }
+    for (let i = first; i < last; i++) {
+      const item = view[i];
+      if (!item) continue;
+      let t = tiles.get(i);
+      if (!t) {
+        t = acquireTile();
+        tiles.set(i, t);
+        canvas.append(t.node);
+      }
+      paintTile(t, item, i);
+    }
+  }
+
+  function render(): void {
+    if (dead) return;
+    if (mode === "grid") renderGrid();
+    else renderList();
+  }
+
   const scheduleRender = rafBatch(render);
 
-  /** Drop every mounted row: a change to `view` invalidates index -> item. */
+  /** Drop every mounted row and tile: a change to `view` — or to the mode —
+   *  invalidates index -> node. Both pools are drained regardless of the
+   *  current mode, because the one being left is the one holding nodes. */
   function unmountAll(): void {
     for (const [i, r] of mounted) {
       mounted.delete(i);
       release(r);
+    }
+    for (const [i, t] of tiles) {
+      tiles.delete(i);
+      releaseTile(t);
+    }
+  }
+
+  /**
+   * The two modes expose different shapes of the same set: a grid of rows, or
+   * a multi-select listbox of items. `aria-rowcount` is a grid's promise about
+   * its rows and means nothing to a listbox, so it is removed rather than left
+   * behind, and the canvas drops its `rowgroup` — an intervening role there
+   * would sever the listbox from its options in the accessibility tree.
+   */
+  function syncViewportRole(): void {
+    if (mode === "grid") {
+      viewport.setAttribute("role", "listbox");
+      viewport.setAttribute("aria-multiselectable", "true");
+      viewport.removeAttribute("aria-rowcount");
+      canvas.setAttribute("role", "presentation");
+    } else {
+      viewport.setAttribute("role", "grid");
+      viewport.removeAttribute("aria-multiselectable");
+      viewport.setAttribute("aria-rowcount", String(view.length));
+      canvas.setAttribute("role", "rowgroup");
     }
   }
 
@@ -649,7 +1138,7 @@ export function createBrowser(opts: {
     const q = query.trim().toLowerCase();
     view = q ? items.filter((it) => it.name.toLowerCase().includes(q)) : items;
     syncTail(); // owns the canvas height: it has to cover the tail skeletons too
-    viewport.setAttribute("aria-rowcount", String(view.length));
+    syncViewportRole();
     if (focusIdx >= view.length) focusIdx = -1;
     unmountAll();
     // The select-all box describes `view`, so a change to `view` changes it
@@ -780,7 +1269,7 @@ export function createBrowser(opts: {
       // would then never fire. Keep pulling until the viewport can scroll —
       // which is also what carries the empty-page walk, since a page with no
       // media leaves `items.length` where it was.
-      more = nextOffset !== null && !stalled && items.length * ROW_H < viewportH + NEAR_BOTTOM;
+      more = nextOffset !== null && !stalled && contentH(items.length) < viewportH + NEAR_BOTTOM;
     } catch (e) {
       if (dead || mine !== token) return;
       loadError = msgOf(e);
@@ -808,8 +1297,11 @@ export function createBrowser(opts: {
     // resize would otherwise read as "near the bottom" and restart the walk.
     if (!channel || dead || loading || stalled || nextOffset === null) return;
     // Derived from the row count instead of scrollHeight so the scroll handler
-    // never forces a layout.
-    const remaining = view.length * ROW_H - (viewport.scrollTop + viewportH);
+    // never forces a layout. In grid mode a page of files is `columns` times
+    // shorter, which is exactly why this goes through contentH(): reading the
+    // list's row height here would keep the pager asleep until the user had
+    // scrolled several screens past where it should have fired.
+    const remaining = contentH(view.length) - (viewport.scrollTop + viewportH);
     if (remaining < NEAR_BOTTOM) void loadPage();
   }
 
@@ -864,28 +1356,40 @@ export function createBrowser(opts: {
     focusIdx = index;
   }
 
+  /** The live node for a view index, whichever pool is currently in use. */
+  function nodeAt(index: number): HTMLElement | undefined {
+    return mode === "grid" ? tiles.get(index)?.node : mounted.get(index)?.node;
+  }
+
   function focusRow(index: number): void {
     if (index < 0 || index >= view.length) return;
     focusIdx = index;
-    const top = index * ROW_H;
-    const bottom = top + ROW_H;
-    if (top < viewport.scrollTop) viewport.scrollTop = top;
-    else if (bottom > viewport.scrollTop + viewportH) {
-      viewport.scrollTop = bottom - viewportH;
+    const grid = mode === "grid";
+    const top = topOf(index);
+    const bottom = top + (grid ? TILE_H : ROW_H);
+    // The grid scrolls one gutter further than strictly needed so the focused
+    // tile lands clear of the edge rather than flush against it — its focus
+    // ring and its rounded corner both live in that margin.
+    const pad = grid ? TILE_GAP : 0;
+    if (top - pad < viewport.scrollTop) viewport.scrollTop = Math.max(0, top - pad);
+    else if (bottom + pad > viewport.scrollTop + viewportH) {
+      viewport.scrollTop = bottom + pad - viewportH;
     }
     render(); // synchronous: the node must exist before we can focus it
-    mounted.get(index)?.node.focus();
+    nodeAt(index)?.focus();
   }
 
-  function rowIndexFrom(target: EventTarget | null): number {
-    const node = target instanceof Element ? target.closest(".media-row") : null;
+  /** Rows and tiles both carry `data-i`, and nothing else in the canvas does —
+   *  the skeletons deliberately have no index — so one lookup serves both. */
+  function indexFrom(target: EventTarget | null): number {
+    const node = target instanceof Element ? target.closest("[data-i]") : null;
     if (!(node instanceof HTMLElement)) return -1;
     const i = Number(node.dataset.i);
     return Number.isInteger(i) ? i : -1;
   }
 
   const onClick = (e: MouseEvent): void => {
-    const index = rowIndexFrom(e.target);
+    const index = indexFrom(e.target);
     if (index < 0) return;
     const item = view[index];
     if (!item) return;
@@ -928,7 +1432,7 @@ export function createBrowser(opts: {
   };
 
   const onFocusIn = (e: FocusEvent): void => {
-    const index = rowIndexFrom(e.target);
+    const index = indexFrom(e.target);
     if (index >= 0) focusIdx = index;
   };
 
@@ -943,15 +1447,30 @@ export function createBrowser(opts: {
       render();
       return;
     }
-    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    // Vertical movement is one *band*, which is `columns` indices — held at 1
+    // in list mode, so this is the original one-row step there. Horizontal
+    // movement only exists in the grid: in a single-column list the left/right
+    // keys are not the list's to take.
+    const horizontal = mode === "grid" && (e.key === "ArrowLeft" || e.key === "ArrowRight");
+    if (e.key === "ArrowDown" || e.key === "ArrowUp" || horizontal) {
       e.preventDefault();
-      const step = e.key === "ArrowDown" ? 1 : -1;
+      const step =
+        e.key === "ArrowDown"
+          ? columns
+          : e.key === "ArrowUp"
+            ? -columns
+            : e.key === "ArrowRight"
+              ? 1
+              : -1;
       const next =
         focusIdx < 0
           ? step > 0
             ? 0
             : view.length - 1
-          : Math.min(view.length - 1, Math.max(0, focusIdx + step));
+          : // Clamped, not wrapped: the last band is usually short, and
+            // arrowing down from a tile above a gap should land on the last
+            // file rather than silently do nothing.
+            Math.min(view.length - 1, Math.max(0, focusIdx + step));
       focusRow(next);
       return;
     }
@@ -1027,13 +1546,79 @@ export function createBrowser(opts: {
     render();
   };
 
+  /** The first visible index, used as the anchor when the geometry changes
+   *  under the user. Derived, never measured — the mounted set may not start
+   *  at the top of the window once overscan is included. */
+  function firstVisible(): number {
+    if (!view.length) return 0;
+    const band = Math.max(0, Math.floor((viewport.scrollTop - topOf(0)) / stride()));
+    return Math.min(view.length - 1, band * columns);
+  }
+
   const ro = new ResizeObserver((entries) => {
-    const h = entries[0]?.contentRect.height ?? 0;
-    if (h === viewportH) return;
+    const rect = entries[0]?.contentRect;
+    const h = rect?.height ?? 0;
+    const w = rect?.width ?? 0;
+    if (h === viewportH && w === viewportW) return;
+    // A 0x0 box means the viewport is between bodies, not that the window was
+    // dragged shut. Re-cutting the grid to one column there — and then back a
+    // tick later — would throw the scroll anchor twice for nothing, so record
+    // the size and wait for the real one.
+    if (w === 0 || h === 0) {
+      viewportW = w;
+      viewportH = h;
+      return;
+    }
+    viewportW = w;
     viewportH = h;
+    // Width feeds `columns`, so a horizontal resize re-cuts the grid: the
+    // canvas gets shorter or taller (same items, different band count) and
+    // every mounted tile moves. Anchoring on the first visible item keeps the
+    // files under the user's eye where they were instead of letting the
+    // scrollbar's fixed pixel offset drift them by pages.
+    const anchorIdx = firstVisible();
+    if (syncGeometry()) {
+      syncTail();
+      viewport.scrollTop = topOf(anchorIdx);
+    }
     render();
     maybePage();
   });
+
+  /**
+   * Switches list <-> grid. Everything downstream of `mode` has to be re-derived
+   * in one go: the geometry, the canvas height, the ARIA shape of the viewport,
+   * and the body itself (the two heads and the two skeletons differ). The
+   * mounted nodes go back to their pools first — index -> node is meaningless
+   * across a mode change, and the other pool's nodes are the wrong shape.
+   */
+  function setMode(next: ViewMode): void {
+    if (next === mode) return;
+    // Read before the switch: the anchor is a view *index*, which survives the
+    // change, whereas the scroll offset it came from does not.
+    const anchorIdx = firstVisible();
+    mode = next;
+    localStorage.setItem(VIEW_MODE_KEY, next);
+    for (const [id, btn] of modeBtns) btn.setAttribute("aria-pressed", String(id === next));
+    viewport.dataset.mode = next;
+    unmountAll();
+    syncGeometry();
+    syncTail();
+    syncViewportRole();
+    syncBody();
+    // After syncBody(): setBody() detaches the viewport to swap the body, and
+    // a detached scroll container forgets its scrollTop.
+    viewport.scrollTop = topOf(anchorIdx);
+    render();
+    maybePage(); // the grid fits more files per screen and may now be short
+  }
+
+  const onViewMode = (e: MouseEvent): void => {
+    const btn = e.target instanceof Element ? e.target.closest("[data-mode]") : null;
+    if (!(btn instanceof HTMLElement)) return;
+    const next = btn.dataset.mode;
+    if (next === "list" || next === "grid") setMode(next);
+  };
 
   viewport.addEventListener("scroll", onScroll, { passive: true });
   viewport.addEventListener("keydown", onKeyDown);
@@ -1041,6 +1626,7 @@ export function createBrowser(opts: {
   canvas.addEventListener("click", onClick);
   searchInput.addEventListener("input", onSearch);
   tabsEl.addEventListener("click", onTabs);
+  viewModeEl.addEventListener("click", onViewMode);
   dlBtn.addEventListener("click", onDownload);
   // `change`, not `click`: it covers Space on the focused box too, and it is
   // not fired by the programmatic writes in syncChrome().
@@ -1074,6 +1660,11 @@ export function createBrowser(opts: {
     else syncBody();
   }
 
+  // `viewportW` is still 0 here, so the grid starts at one column and the
+  // ResizeObserver re-cuts it before the first paint. The call is still needed
+  // so `tileW` and `geomV` are never read unset.
+  syncGeometry();
+  syncViewportRole();
   syncChrome();
   syncBody();
 
@@ -1105,11 +1696,13 @@ export function createBrowser(opts: {
       canvas.removeEventListener("click", onClick);
       searchInput.removeEventListener("input", onSearch);
       tabsEl.removeEventListener("click", onTabs);
+      viewModeEl.removeEventListener("click", onViewMode);
       dlBtn.removeEventListener("click", onDownload);
       selectAll.removeEventListener("change", onSelectAll);
       ro.disconnect();
       unmountAll();
       pool.length = 0;
+      tilePool.length = 0;
     },
   };
 }

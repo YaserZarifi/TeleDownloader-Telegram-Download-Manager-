@@ -142,6 +142,9 @@ pub struct MediaItem {
     /// Unix seconds.
     pub date: i64,
     pub duration: Option<i64>,
+    /// Tiny inline JPEG data URI reconstructed from the stripped thumbnail
+    /// Telegram ships with the message. Free — no extra request per item.
+    pub thumb: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

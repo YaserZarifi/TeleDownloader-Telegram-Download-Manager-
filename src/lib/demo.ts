@@ -617,6 +617,8 @@ function itemAt(channelId: number, index: number): MediaItem {
     size,
     date,
     duration,
+    // Fixtures carry no preview bytes; the grid falls back to its glyph.
+    thumb: null,
   };
 }
 
@@ -937,6 +939,7 @@ function enqueue(channelId: number, messageIds: number[]): Job[] {
       size: 12 * MB,
       date: nowSec(),
       duration: null,
+      thumb: null,
     };
 
     jobCounter += 1;

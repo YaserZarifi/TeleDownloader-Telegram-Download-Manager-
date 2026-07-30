@@ -1,0 +1,203 @@
+/* Boot skeleton + welcome banner.
+   Own stylesheet so it stays out of the main design-system file. Tokens come
+   from styles.css, which main.ts imports first. */
+
+.boot {
+  display: grid;
+  grid-template-rows: var(--header-h) var(--wire-h) 1fr;
+  height: 100vh;
+  background: var(--ink-900);
+  overflow: hidden;
+}
+
+.boot-masthead {
+  display: flex;
+  align-items: center;
+  gap: var(--s4);
+  padding: 0 var(--s4);
+  background: linear-gradient(180deg, var(--ink-850), var(--ink-900));
+  border-bottom: 1px solid var(--line);
+}
+
+/* The brand is real, not a placeholder: showing it instantly is what makes a
+   cold start feel like the app opening rather than a blank window. */
+.boot-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.06em;
+  color: var(--text);
+}
+.boot-brand svg {
+  color: var(--amber);
+}
+.boot-brand-dim {
+  color: var(--text-faint);
+  font-weight: 500;
+}
+.boot-spacer {
+  flex: 1;
+}
+
+/* The idle wire: a flat cyan line, exactly what the real canvas draws when
+   nothing is transferring. */
+.boot-wire {
+  background: var(--ink-950);
+  border-bottom: 1px solid var(--line);
+  position: relative;
+}
+.boot-wire::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1.5px;
+  background: var(--cyan);
+  opacity: 0.5;
+}
+
+.boot-body {
+  display: grid;
+  grid-template-columns: var(--rail-w) 1fr;
+  min-height: 0;
+}
+
+.boot-rail {
+  border-right: 1px solid var(--line);
+  background: var(--ink-950);
+  padding: var(--s4) var(--s3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s3);
+  overflow: hidden;
+}
+
+.boot-chan {
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  align-items: center;
+  gap: var(--s3);
+}
+.boot-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--r-sm);
+  background: var(--ink-800);
+}
+.boot-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.boot-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+.boot-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  padding: var(--s3) var(--s4);
+  border-bottom: 1px solid var(--line);
+}
+.boot-row {
+  display: grid;
+  grid-template-columns: 52px 26px minmax(0, 1fr) 88px;
+  align-items: center;
+  gap: var(--s3);
+  height: var(--row-h);
+  padding: 0 var(--s4);
+  border-bottom: 1px solid var(--ink-850);
+}
+.boot-plate {
+  width: 26px;
+  height: 26px;
+  border-radius: var(--r-sm);
+  background: var(--ink-800);
+}
+
+/* Shimmer moves background-position only — no layout, no paint of anything
+   but this element, so a cold start is never competing with the real work. */
+.boot-bar {
+  display: block;
+  border-radius: var(--r-sm);
+  background: linear-gradient(
+    90deg,
+    var(--ink-800) 0%,
+    var(--ink-750) 40%,
+    var(--ink-800) 80%
+  );
+  background-size: 280% 100%;
+  animation: boot-sweep 1500ms linear infinite;
+}
+@keyframes boot-sweep {
+  from {
+    background-position: 140% 0;
+  }
+  to {
+    background-position: -140% 0;
+  }
+}
+
+/* ---------- welcome banner ---------------------------------------------- */
+
+.welcome {
+  position: fixed;
+  left: 50%;
+  bottom: var(--s5);
+  transform: translateX(-50%);
+  z-index: 300;
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  padding: var(--s3) var(--s5);
+  border: 1px solid var(--cyan-dim);
+  border-radius: 99px;
+  background: var(--ink-850);
+  box-shadow: 0 16px 40px -18px #000e;
+  animation: welcome-in var(--dur-slow) var(--ease);
+}
+.welcome-mark {
+  display: inline-flex;
+  color: var(--amber);
+}
+.welcome-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+.welcome-sub {
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+.welcome[data-leaving="true"] {
+  animation: welcome-out 240ms var(--ease) forwards;
+}
+@keyframes welcome-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 14px);
+  }
+}
+@keyframes welcome-out {
+  to {
+    opacity: 0;
+    transform: translate(-50%, 10px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .boot-bar {
+    animation: none;
+    background: var(--ink-800);
+  }
+  .welcome,
+  .welcome[data-leaving="true"] {
+    animation: none;
+  }
+}

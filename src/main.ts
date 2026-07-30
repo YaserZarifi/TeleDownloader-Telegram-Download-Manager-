@@ -32,6 +32,7 @@ import { debounce, el, modal, must, toast } from "./lib/ui";
 import { speed } from "./lib/format";
 import { createWire, type Wire } from "./wire";
 import { createLogin } from "./views/login";
+import { bootSkeleton, welcomeBanner } from "./views/boot";
 import { createBrowser, type BrowserView } from "./views/browser";
 import { createDownloads, type DownloadsView } from "./views/downloads";
 import { openSettings } from "./views/settings";
@@ -51,6 +52,8 @@ let railQuery = "";
 let railFolder: ChatKind | "all" = "all";
 let railFolderStrip: HTMLElement | null = null;
 let railFolderFades: (() => void) | null = null;
+/** The welcome banner is a launch event, not a render event. */
+let greeted = false;
 /** Which channel the browser is showing, so the rail can survive re-renders. */
 let selectedChannelId: number | null = null;
 let settings: Settings | null = null;
@@ -70,6 +73,10 @@ function jobStateIndex(): Map<string, JobState> {
 /* ------------------------------------------------------------------- boot */
 
 async function boot(): Promise<void> {
+  // Paint the frame before asking the backend anything. Reading the keychain,
+  // opening the session store and reaching Telegram takes seconds on a cold
+  // start, and an empty window in the meantime reads as a failed launch.
+  root.replaceChildren(bootSkeleton());
   try {
     const state = await ipc.getAuthState();
     route(state);
@@ -313,6 +320,14 @@ async function mountShell(auth: Extract<AuthState, { stage: "ready" }>): Promise
   await loadChannels(railList);
   addBtn.addEventListener("click", () => promptChannel(railList));
   await refreshJobs();
+
+  // Once, per launch — a banner that reappears on every re-render is noise.
+  // It exists to confirm *which* account is connected, which is worth stating
+  // plainly for an app that signs into a real one.
+  if (!greeted) {
+    greeted = true;
+    document.body.append(welcomeBanner(auth.user.first_name || "your account"));
+  }
 
   /* --- live updates --- */
   const applyQueueBadge = () => {

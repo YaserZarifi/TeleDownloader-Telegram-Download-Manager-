@@ -65,6 +65,8 @@ export interface MediaItem {
   date: number;
   /** Video/audio duration in seconds, when known. */
   duration: number | null;
+  /** Tiny inline JPEG data URI, or null. Arrives with the listing — free. */
+  thumb: string | null;
 }
 
 export interface MediaPage {
