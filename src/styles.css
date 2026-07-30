@@ -1,0 +1,1571 @@
+/* ==========================================================================
+   TeleWire — "The Sounder"
+   --------------------------------------------------------------------------
+   Design thesis: this app is a direct wire between one machine and Telegram's
+   data centers. The interface is an *instrument panel* reading that wire, not
+   a web dashboard. Three ideas carry it:
+
+     1. Ink navy, not near-black. Deep blue-black reads as equipment housing;
+        #000 reads as "AI dark mode template".
+     2. Amber = bytes actually moving. Cyan = connected but idle. These two
+        colors are load-bearing status signals, never decoration.
+     3. The file list is a manifest. Manifests are monospaced ledgers, so it
+        is set in mono and its numbering encodes real chronological position
+        in the channel.
+
+   Type is bundled locally (@fontsource) — never fetched from a CDN at
+   runtime, because §12 promises no network calls other than to Telegram.
+   ========================================================================== */
+
+/* ---------- 1. Tokens --------------------------------------------------- */
+
+:root {
+  /* Ink — the housing. Hue held at ~217 so every surface stays navy-tinted. */
+  --ink-1000: #05090f;
+  --ink-950: #070d16;
+  --ink-900: #0b1220; /* app background */
+  --ink-850: #101a2b; /* panel */
+  --ink-800: #16233a; /* raised surface, row hover */
+  --ink-750: #1b2b45;
+  --ink-700: #22355260; /* hairline rules */
+  --line: #1a2942;
+  --line-strong: #263a5c;
+
+  /* Signal colors. Amber and cyan are status, not accents-for-flavour. */
+  --amber: #f2a93b; /* bytes in flight */
+  --amber-hi: #ffc46b;
+  --amber-dim: #8a6224;
+  --cyan: #43c6d8; /* connected, idle, healthy */
+  --cyan-hi: #7fe0ee;
+  --cyan-dim: #24606b;
+  --violet: #8b7cf6; /* queued / waiting */
+  --danger: #ff6b6b;
+  --danger-dim: #7a2b2b;
+  --ok: #56d364;
+
+  /* Text — all four pass 4.5:1 on --ink-900. */
+  --text: #e8eef7;
+  --text-dim: #93a4bd;
+  --text-faint: #6b7f9c;
+  --text-on-amber: #1a1204;
+
+  /* Type */
+  --font-sans: "Space Grotesk", "Segoe UI Variable Display", "Segoe UI",
+    system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Mono", "SF Mono", Consolas,
+    ui-monospace, monospace;
+
+  /* Density 8/10 — this is a dashboard, not a marketing page. */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 24px;
+  --s6: 32px;
+  --s7: 48px;
+
+  --r-sm: 4px;
+  --r-md: 7px;
+  --r-lg: 12px;
+
+  --header-h: 52px;
+  --wire-h: 26px;
+  --rail-w: 232px;
+  --row-h: 44px;
+
+  /* Motion. ease-out for entering, faster ease-in for leaving. */
+  --dur-fast: 120ms;
+  --dur: 180ms;
+  --dur-slow: 300ms;
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+
+  --shadow-panel: 0 1px 0 #ffffff08 inset, 0 8px 24px -12px #000c;
+  --focus: 0 0 0 2px var(--ink-900), 0 0 0 4px var(--cyan);
+
+  color-scheme: dark;
+}
+
+/* ---------- 2. Reset ---------------------------------------------------- */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--ink-900);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  overflow: hidden; /* the app owns its own scroll containers */
+  -webkit-font-smoothing: antialiased;
+  /* A desktop app is not a document — kill web-page text selection except
+     where content is genuinely selectable (paths, filenames, errors). */
+  user-select: none;
+  cursor: default;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+  background: none;
+  border: none;
+  padding: 0;
+}
+
+:focus {
+  outline: none;
+}
+
+:focus-visible {
+  box-shadow: var(--focus);
+  border-radius: var(--r-sm);
+}
+
+.selectable {
+  user-select: text;
+  cursor: text;
+}
+
+::-webkit-scrollbar {
+  width: 11px;
+  height: 11px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--ink-750);
+  border: 3px solid var(--ink-900);
+  border-radius: 99px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--line-strong);
+}
+
+/* Screen-reader-only, but still focusable (skip link). */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+.skip-link:focus-visible {
+  position: fixed;
+  top: var(--s3);
+  left: var(--s3);
+  z-index: 999;
+  width: auto;
+  height: auto;
+  clip: auto;
+  padding: var(--s2) var(--s4);
+  background: var(--cyan);
+  color: var(--ink-1000);
+  border-radius: var(--r-md);
+  font-weight: 600;
+}
+
+/* ---------- 3. Type helpers -------------------------------------------- */
+
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "zero" 1;
+}
+
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.eyebrow {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+h1 {
+  font-size: 22px;
+}
+h2 {
+  font-size: 16px;
+}
+h3 {
+  font-size: 13px;
+}
+
+/* ---------- 4. App frame ------------------------------------------------ */
+
+#app {
+  display: grid;
+  grid-template-rows: var(--header-h) var(--wire-h) 1fr;
+  height: 100vh;
+}
+
+.masthead {
+  display: flex;
+  align-items: center;
+  gap: var(--s4);
+  padding: 0 var(--s4);
+  background: linear-gradient(180deg, var(--ink-850), var(--ink-900));
+  border-bottom: 1px solid var(--line);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.06em;
+}
+.brand svg {
+  color: var(--amber);
+}
+.brand b {
+  font-weight: 700;
+}
+.brand span {
+  color: var(--text-faint);
+  font-weight: 500;
+}
+
+/* Live link indicator — the one place "connected" is stated in words. */
+.link-state {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: var(--s1) var(--s3);
+  border: 1px solid var(--line);
+  border-radius: 99px;
+  background: var(--ink-950);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.link-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  flex: none;
+}
+.link-state[data-state="online"] .link-dot {
+  background: var(--cyan);
+  box-shadow: 0 0 0 3px #43c6d827;
+}
+.link-state[data-state="online"] {
+  color: var(--cyan);
+  border-color: var(--cyan-dim);
+}
+.link-state[data-state="transfer"] .link-dot {
+  background: var(--amber);
+  box-shadow: 0 0 0 3px #f2a93b27;
+}
+.link-state[data-state="transfer"] {
+  color: var(--amber);
+  border-color: var(--amber-dim);
+}
+.link-state[data-state="offline"] .link-dot {
+  background: var(--danger);
+}
+
+.masthead-spacer {
+  flex: 1;
+}
+
+/* ---------- 5. The wire (signature element) ----------------------------- */
+/* A live oscilloscope trace of real aggregate throughput. Idle = flat cyan
+   line. Transferring = amber pulses whose rate and amplitude are driven by
+   actual bytes/sec, not by a decorative timer. */
+
+.wire {
+  position: relative;
+  background: var(--ink-950);
+  border-bottom: 1px solid var(--line);
+  overflow: hidden;
+}
+.wire canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.wire-readout {
+  position: absolute;
+  inset: 0 var(--s4) 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+  pointer-events: none;
+  background: linear-gradient(90deg, #070d1600, var(--ink-950) 24px);
+  padding-left: var(--s6);
+}
+.wire-readout b {
+  color: var(--amber);
+  font-weight: 500;
+}
+
+/* ---------- 6. Body layout ---------------------------------------------- */
+
+.workspace {
+  display: grid;
+  grid-template-columns: var(--rail-w) 1fr;
+  min-height: 0;
+}
+
+.rail {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--ink-950);
+  border-right: 1px solid var(--line);
+}
+
+/* Drag handle on the rail's right edge. Sits over the border rather than
+   taking a grid column, so the grid stays a clean two-column layout. The hit
+   area is wider than the visible line — a 1px target is unusable. */
+.rail-resizer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: -3px;
+  width: 7px;
+  z-index: 5;
+  cursor: col-resize;
+  touch-action: none;
+}
+.rail-resizer::after {
+  content: "";
+  position: absolute;
+  inset: 0 3px;
+  background: transparent;
+  transition: background var(--dur) var(--ease);
+}
+.rail-resizer:hover::after,
+.rail-resizer[data-dragging="true"]::after,
+.rail-resizer:focus-visible::after {
+  background: var(--cyan);
+}
+.rail-resizer:focus-visible {
+  box-shadow: none;
+}
+
+.rail-head {
+  padding: var(--s3) var(--s3) var(--s2);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+}
+.rail-head .search {
+  max-width: none;
+  width: 100%;
+}
+.rail-head .input {
+  height: 30px;
+  font-size: 12px;
+}
+
+/* Category heading inside the rail. Sticky so the group a channel belongs to
+   stays visible while scrolling a long list. */
+.rail-group {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: var(--s3) var(--s3) var(--s1);
+  background: linear-gradient(180deg, var(--ink-950) 70%, transparent);
+}
+.rail-group .count-pill {
+  background: transparent;
+  border: 1px solid var(--line);
+}
+.rail-empty {
+  padding: var(--s4) var(--s3);
+  font-size: 12px;
+  color: var(--text-faint);
+  line-height: 1.5;
+}
+
+/* Below this width the rail collapses to icons, so its search box and group
+   headings have nothing to label. */
+@media (max-width: 880px) {
+  .rail-head .search,
+  .rail-group {
+    display: none;
+  }
+}
+
+.rail-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 var(--s2) var(--s3);
+}
+
+.rail-foot {
+  border-top: 1px solid var(--line);
+  padding: var(--s2);
+}
+
+.main {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+/* Views root themselves at `.main` so they work standalone; when one is
+   mounted inside the shell's pane host it has to claim the leftover height,
+   or nested flex columns collapse to their content. */
+.main > .main {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* ---------- 7. Controls ------------------------------------------------- */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s2);
+  height: 34px;
+  padding: 0 var(--s4);
+  border-radius: var(--r-md);
+  border: 1px solid var(--line-strong);
+  background: var(--ink-800);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  transition: background var(--dur-fast) var(--ease),
+    border-color var(--dur-fast) var(--ease), transform var(--dur-fast) var(--ease);
+}
+.btn:hover:not(:disabled) {
+  background: var(--ink-750);
+  border-color: #33507c;
+}
+.btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: var(--amber);
+  border-color: var(--amber);
+  color: var(--text-on-amber);
+  font-weight: 600;
+}
+.btn-primary:hover:not(:disabled) {
+  background: var(--amber-hi);
+  border-color: var(--amber-hi);
+}
+
+.btn-ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-dim);
+}
+.btn-ghost:hover:not(:disabled) {
+  background: var(--ink-800);
+  color: var(--text);
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: #3a1c1c;
+  border-color: var(--danger-dim);
+  color: var(--danger);
+}
+
+/* Icon-only buttons must still carry an accessible name (aria-label) and a
+   tooltip — never ship a bare glyph. */
+.btn-icon {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  flex: none;
+  border-radius: var(--r-md);
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid transparent;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+.btn-icon:hover:not(:disabled) {
+  background: var(--ink-800);
+  color: var(--text);
+}
+.btn-icon:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+}
+.field > label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-dim);
+}
+.field-hint {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  line-height: 1.45;
+}
+.field-error {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s2);
+  font-size: 12px;
+  color: var(--danger);
+}
+
+.input {
+  height: 36px;
+  width: 100%;
+  padding: 0 var(--s3);
+  border-radius: var(--r-md);
+  border: 1px solid var(--line-strong);
+  background: var(--ink-950);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  transition: border-color var(--dur-fast) var(--ease),
+    box-shadow var(--dur-fast) var(--ease);
+  user-select: text;
+  cursor: text;
+}
+.input::placeholder {
+  color: var(--text-faint);
+}
+.input:hover {
+  border-color: #33507c;
+}
+.input:focus-visible {
+  border-color: var(--cyan);
+  box-shadow: 0 0 0 3px #43c6d822;
+}
+.input[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+select.input {
+  font-family: var(--font-sans);
+  cursor: pointer;
+  user-select: none;
+}
+
+/* Range: the track reads as a wire and the thumb as a tap on it, which keeps
+   the concurrency sliders in the same visual language as everything else. */
+input[type="range"] {
+  appearance: none;
+  width: 100%;
+  height: 20px;
+  background: transparent;
+  cursor: pointer;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: 99px;
+  background: var(--ink-750);
+}
+input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -5.5px;
+  border-radius: 50%;
+  background: var(--amber);
+  border: 2px solid var(--ink-850);
+  transition: transform var(--dur-fast) var(--ease);
+}
+input[type="range"]:hover::-webkit-slider-thumb {
+  transform: scale(1.15);
+}
+input[type="range"]:focus-visible {
+  box-shadow: none;
+}
+input[type="range"]:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px #43c6d855;
+}
+input[type="range"]::-moz-range-track {
+  height: 3px;
+  border-radius: 99px;
+  background: var(--ink-750);
+}
+input[type="range"]::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--amber);
+  border: 2px solid var(--ink-850);
+}
+
+output.mono {
+  color: var(--amber);
+  font-size: 12px;
+}
+
+.switch {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s3);
+  cursor: pointer;
+}
+.switch input {
+  appearance: none;
+  width: 34px;
+  height: 20px;
+  flex: none;
+  margin: 0;
+  border-radius: 99px;
+  background: var(--ink-750);
+  border: 1px solid var(--line-strong);
+  position: relative;
+  cursor: pointer;
+  transition: background var(--dur) var(--ease);
+}
+.switch input::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  transition: transform var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.switch input:checked {
+  background: var(--cyan-dim);
+  border-color: var(--cyan);
+}
+.switch input:checked::after {
+  transform: translateX(14px);
+  background: var(--cyan);
+}
+
+/* ---------- 8. Tabs / segmented ---------------------------------------- */
+
+.tabs {
+  display: flex;
+  gap: var(--s1);
+  padding: var(--s1);
+  background: var(--ink-950);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+}
+.tab {
+  flex: 1;
+  height: 28px;
+  padding: 0 var(--s3);
+  border-radius: var(--r-sm);
+  color: var(--text-dim);
+  font-size: 12.5px;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s2);
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+.tab:hover {
+  color: var(--text);
+}
+.tab[aria-selected="true"] {
+  background: var(--ink-800);
+  color: var(--text);
+}
+
+.count-pill {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 99px;
+  background: var(--ink-750);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.count-pill[data-active="true"] {
+  background: var(--amber);
+  color: var(--text-on-amber);
+}
+
+/* ---------- 9. Channel rail items --------------------------------------- */
+
+.chan {
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  align-items: center;
+  gap: var(--s3);
+  width: 100%;
+  padding: var(--s2) var(--s3);
+  border-radius: var(--r-md);
+  text-align: left;
+  color: var(--text-dim);
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+.chan:hover {
+  background: var(--ink-850);
+  color: var(--text);
+}
+.chan[aria-current="true"] {
+  background: var(--ink-800);
+  color: var(--text);
+  box-shadow: inset 2px 0 0 var(--amber);
+}
+.chan-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--r-sm);
+  display: grid;
+  place-items: center;
+  background: var(--ink-750);
+  color: var(--cyan);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 500;
+  flex: none;
+  overflow: hidden;
+}
+.chan-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+/* Saved Messages is the account's own store, not a channel — amber marks it as
+   the one entry that is "yours". */
+.chan-avatar[data-saved="true"] {
+  background: #f2a93b1f;
+  color: var(--amber);
+}
+.chan-text {
+  min-width: 0;
+}
+.chan-name {
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chan-meta {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---------- 10. Toolbar ------------------------------------------------- */
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  padding: var(--s3) var(--s4);
+  border-bottom: 1px solid var(--line);
+  background: var(--ink-900);
+  flex: none;
+}
+.toolbar-title {
+  min-width: 0;
+}
+.toolbar-title h2 {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.toolbar-sub {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.search {
+  position: relative;
+  flex: 1;
+  max-width: 320px;
+}
+.search .input {
+  padding-left: 32px;
+}
+.search svg {
+  position: absolute;
+  left: 9px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-faint);
+  pointer-events: none;
+}
+
+/* ---------- 11. The manifest (media list) ------------------------------- */
+/* Virtualized: .manifest-viewport scrolls, .manifest-canvas is spacer-sized
+   to the full row count, rows are absolutely positioned. Never render more
+   than the visible window plus overscan. */
+
+.manifest-head,
+.media-row {
+  display: grid;
+  grid-template-columns: 52px 32px minmax(0, 1fr) 88px 96px 128px 44px;
+  align-items: center;
+  gap: var(--s3);
+  padding: 0 var(--s4);
+}
+
+.manifest-head {
+  height: 30px;
+  flex: none;
+  border-bottom: 1px solid var(--line);
+  background: var(--ink-950);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+.manifest-head > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.manifest-viewport {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  position: relative;
+  contain: strict;
+}
+.manifest-canvas {
+  position: relative;
+  width: 100%;
+}
+
+.media-row {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: var(--row-h);
+  border-bottom: 1px solid var(--ink-850);
+  color: var(--text-dim);
+  transition: background var(--dur-fast) linear;
+  content-visibility: auto;
+}
+.media-row:hover {
+  background: var(--ink-850);
+}
+.media-row[data-selected="true"] {
+  background: var(--ink-800);
+  box-shadow: inset 2px 0 0 var(--cyan);
+}
+.media-row:focus-visible {
+  background: var(--ink-800);
+  box-shadow: var(--focus) inset;
+}
+
+/* The sequence number is real data: chronological position in the channel,
+   oldest = 1. Not a decorative counter. */
+.m-seq {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-faint);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.m-kind {
+  width: 26px;
+  height: 26px;
+  border-radius: var(--r-sm);
+  display: grid;
+  place-items: center;
+  background: var(--ink-800);
+  color: var(--text-dim);
+  flex: none;
+}
+.media-row[data-kind="video"] .m-kind {
+  color: var(--violet);
+}
+.media-row[data-kind="audio"] .m-kind {
+  color: var(--cyan);
+}
+.media-row[data-kind="photo"] .m-kind {
+  color: var(--amber);
+}
+
+.m-name {
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: ltr;
+}
+.m-size,
+.m-date {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+}
+.m-size {
+  text-align: right;
+}
+.m-status {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.m-status[data-s="running"] {
+  color: var(--amber);
+}
+.m-status[data-s="done"] {
+  color: var(--ok);
+}
+.m-status[data-s="error"] {
+  color: var(--danger);
+}
+.m-status[data-s="queued"],
+.m-status[data-s="paused"] {
+  color: var(--violet);
+}
+
+.m-action {
+  display: flex;
+  justify-content: flex-end;
+}
+/* Row actions appear on hover/focus but must remain reachable by keyboard,
+   so they are hidden with opacity, never display:none. */
+.media-row .m-action .btn-icon {
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease);
+}
+.media-row:hover .m-action .btn-icon,
+.media-row:focus-within .m-action .btn-icon,
+.media-row .m-action .btn-icon:focus-visible {
+  opacity: 1;
+}
+
+/* ---------- 12. Download queue rows ------------------------------------- */
+
+.queue {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--s3) var(--s4) var(--s6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+}
+
+.job {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--s3);
+  padding: var(--s3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--ink-850);
+  box-shadow: var(--shadow-panel);
+  transition: border-color var(--dur) var(--ease);
+}
+.job[data-state="running"] {
+  border-color: var(--amber-dim);
+}
+.job[data-state="error"] {
+  border-color: var(--danger-dim);
+}
+
+.job-icon {
+  width: 30px;
+  height: 30px;
+  border-radius: var(--r-sm);
+  display: grid;
+  place-items: center;
+  background: var(--ink-800);
+  color: var(--text-dim);
+}
+.job[data-state="running"] .job-icon {
+  color: var(--amber);
+}
+.job[data-state="done"] .job-icon {
+  color: var(--ok);
+}
+.job[data-state="error"] .job-icon {
+  color: var(--danger);
+}
+
+.job-body {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.job-name {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.job-stats {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+  flex-wrap: wrap;
+}
+.job-stats .sep {
+  color: var(--line-strong);
+}
+.job-stats b {
+  color: var(--amber);
+  font-weight: 500;
+}
+.job-err {
+  font-size: 11.5px;
+  color: var(--danger);
+  user-select: text;
+}
+
+/* Progress bar. Width is animated, never layout-thrashing properties. */
+.bar {
+  position: relative;
+  height: 4px;
+  border-radius: 99px;
+  background: var(--ink-750);
+  overflow: hidden;
+}
+.bar-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: 99px;
+  background: linear-gradient(90deg, var(--amber-dim), var(--amber));
+  transition: width var(--dur-slow) linear;
+}
+.job[data-state="done"] .bar-fill {
+  background: var(--ok);
+}
+.job[data-state="error"] .bar-fill {
+  background: var(--danger-dim);
+}
+.job[data-state="paused"] .bar-fill {
+  background: var(--violet);
+}
+
+/* Per-worker segments — a literal readout of the parallel connections. */
+.workers {
+  display: flex;
+  gap: 2px;
+  height: 3px;
+}
+.worker {
+  flex: 1;
+  border-radius: 99px;
+  background: var(--ink-750);
+  overflow: hidden;
+  position: relative;
+}
+.worker i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: var(--cyan);
+  transition: width var(--dur-slow) linear;
+}
+
+.job-actions {
+  display: flex;
+  gap: var(--s1);
+}
+
+/* Completion micro-interaction: one short pulse, then done. Not a loop. */
+@keyframes land {
+  0% {
+    box-shadow: 0 0 0 0 #56d36455;
+  }
+  100% {
+    box-shadow: 0 0 0 10px #56d36400;
+  }
+}
+.job[data-just-done="true"] .job-icon {
+  animation: land 620ms var(--ease) 1;
+}
+
+/* ---------- 13. Panels, modal, empty states ----------------------------- */
+
+.panel {
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--ink-850);
+  box-shadow: var(--shadow-panel);
+}
+
+.empty {
+  flex: 1;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: var(--s3);
+  padding: var(--s7) var(--s5);
+  text-align: center;
+  color: var(--text-faint);
+}
+.empty svg {
+  color: var(--line-strong);
+}
+.empty h3 {
+  color: var(--text-dim);
+  font-size: 14px;
+}
+.empty p {
+  margin: 0;
+  max-width: 42ch;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.scrim {
+  position: fixed;
+  inset: 0;
+  background: #030711cc;
+  display: grid;
+  place-items: center;
+  padding: var(--s5);
+  z-index: 100;
+  animation: fade var(--dur) var(--ease);
+}
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+}
+.modal {
+  width: min(560px, 100%);
+  max-height: calc(100vh - 2 * var(--s5));
+  overflow-y: auto;
+  padding: var(--s5);
+  animation: rise var(--dur-slow) var(--ease);
+}
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.985);
+  }
+}
+.modal-head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s3);
+  margin-bottom: var(--s4);
+}
+.modal-head .modal-title {
+  flex: 1;
+}
+.modal-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--s2);
+  margin-top: var(--s5);
+}
+
+/* ---------- 14. Login ---------------------------------------------------- */
+
+.auth {
+  height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: var(--s5);
+  overflow-y: auto;
+  /* One faint amber source, top-centre — the sounder's lamp. No blur blobs. */
+  background: radial-gradient(
+      120% 70% at 50% -10%,
+      #f2a93b0e,
+      transparent 60%
+    ),
+    var(--ink-900);
+}
+.auth-card {
+  width: min(420px, 100%);
+  padding: var(--s6);
+}
+.auth-brand {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--s2);
+  margin-bottom: var(--s5);
+  text-align: center;
+}
+.auth-brand svg {
+  color: var(--amber);
+}
+.auth-brand h1 {
+  font-size: 20px;
+  letter-spacing: 0.1em;
+}
+.auth-brand p {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--text-faint);
+  line-height: 1.55;
+}
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s4);
+}
+.auth-steps {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  justify-content: center;
+  margin-bottom: var(--s5);
+}
+.auth-step {
+  height: 3px;
+  width: 34px;
+  border-radius: 99px;
+  background: var(--ink-750);
+  transition: background var(--dur) var(--ease);
+}
+.auth-step[data-done="true"] {
+  background: var(--cyan-dim);
+}
+.auth-step[data-current="true"] {
+  background: var(--amber);
+}
+.auth-note {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  line-height: 1.6;
+  padding: var(--s3);
+  border-radius: var(--r-md);
+  background: var(--ink-950);
+  border: 1px solid var(--line);
+}
+.auth-note a {
+  color: var(--cyan);
+}
+
+/* First-run setup, shown only when the build carries no embedded app
+   credentials. Numbered steps because it is a short procedure, not a form. */
+.setup-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s3);
+}
+.setup-step {
+  display: grid;
+  grid-template-columns: 22px 1fr;
+  gap: var(--s3);
+  align-items: start;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text-dim);
+}
+.setup-num {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: var(--ink-800);
+  border: 1px solid var(--line-strong);
+  color: var(--cyan);
+  font-size: 11px;
+}
+.setup-step .btn {
+  margin-top: var(--s2);
+  height: 30px;
+}
+
+/* Segmented code entry — five slots so the login code reads as an instrument
+   readout rather than a generic text box. */
+.code-slots {
+  display: flex;
+  gap: var(--s2);
+  justify-content: center;
+}
+.code-slots input {
+  width: 44px;
+  height: 54px;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 22px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--line-strong);
+  background: var(--ink-950);
+  color: var(--text);
+  caret-color: var(--amber);
+}
+.code-slots input:focus-visible {
+  border-color: var(--amber);
+  box-shadow: 0 0 0 3px #f2a93b22;
+}
+
+/* ---------- 15. Toasts --------------------------------------------------- */
+
+.toasts {
+  position: fixed;
+  right: var(--s4);
+  bottom: var(--s4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+  z-index: 200;
+  pointer-events: none;
+}
+.toast {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s3);
+  max-width: 380px;
+  padding: var(--s3) var(--s4);
+  border-radius: var(--r-md);
+  border: 1px solid var(--line-strong);
+  background: var(--ink-800);
+  box-shadow: 0 12px 32px -12px #000e;
+  font-size: 12.5px;
+  pointer-events: auto;
+  animation: rise var(--dur-slow) var(--ease);
+}
+.toast[data-kind="error"] {
+  border-color: var(--danger-dim);
+  color: var(--danger);
+}
+.toast[data-kind="ok"] {
+  border-color: var(--cyan-dim);
+}
+.toast svg {
+  flex: none;
+  margin-top: 1px;
+}
+
+/* ---------- 16. Responsive ---------------------------------------------- */
+/* Verified at 1440 / 1024 / 860 / 720px wide — the app must stay usable when
+   the window is dragged small, which is the desktop equivalent of mobile. */
+
+@media (max-width: 1100px) {
+  .manifest-head,
+  .media-row {
+    grid-template-columns: 44px 32px minmax(0, 1fr) 84px 112px 44px;
+  }
+  .m-date {
+    display: none;
+  }
+}
+
+@media (max-width: 880px) {
+  /* Overrides any dragged width: below this the rail is icons-only, and a
+     user-set 400px would leave no room for the file list. */
+  #app {
+    --rail-w: 60px !important;
+  }
+  .rail-resizer {
+    display: none;
+  }
+  .rail .chan-text,
+  .rail-head .rail-title,
+  .rail-foot .btn span {
+    display: none;
+  }
+  .chan {
+    grid-template-columns: 28px;
+    justify-content: center;
+  }
+  .toolbar .search {
+    max-width: none;
+  }
+}
+
+@media (max-width: 720px) {
+  .manifest-head,
+  .media-row {
+    grid-template-columns: 32px minmax(0, 1fr) 80px 44px;
+  }
+  .m-status,
+  .m-seq {
+    display: none;
+  }
+  .wire-readout .wire-peak {
+    display: none;
+  }
+}
+
+/* ---------- 17. Reduced motion ------------------------------------------ */
+/* Not a blanket kill-switch: transitions collapse to instant, and the wire
+   canvas stops animating (handled in wire.ts by reading this same query), but
+   nothing becomes unreadable. */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+}
+
+/* ---------- 18. Scan state: skeletons ----------------------------------- */
+/* Reading a chat's manifest means walking its messages, not its files, so the
+   first page can take seconds on a text-heavy chat. Blank panels read as a
+   broken app; placeholder rows read as work in progress. */
+
+/* The line under the toolbar. Flex, so the [hidden] attribute needs its own
+   rule — the UA's `[hidden] { display: none }` loses to a class selector. */
+.scan-note {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: var(--s2) var(--s4);
+  border-bottom: 1px solid var(--line);
+  background: var(--ink-950);
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.scan-note[hidden] {
+  display: none;
+}
+
+/* First-page placeholders. Overflow is clipped rather than scrolled: the row
+   count is a guess at how many fit, and a scrollbar that vanishes when the
+   real list arrives is its own layout shift. */
+.skel-list {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  overflow: hidden;
+}
+
+/* A skeleton row carries `.media-row` so it inherits the same 7-column grid
+   *and* the responsive rules that drop columns from it — that is what keeps
+   the swap from real rows free of layout shift. Only positioning differs:
+   in the first-page list the rows are in flow, while the ones appended to
+   `.manifest-canvas` stay absolute like every other virtualized row. */
+.skel-list .skel-row {
+  position: relative;
+}
+.skel-row {
+  /* Never hoverable, selectable or focusable — it is not a row, it is a hole
+     where a row will be. */
+  pointer-events: none;
+  background: none;
+}
+
+.skel-bar {
+  display: block;
+  height: 10px;
+  border-radius: var(--r-sm);
+  background-color: var(--ink-800);
+  /* Highlight is half the element wide and swept across it. Only
+     background-position animates: width/left would force layout every frame,
+     and on a 12-row skeleton that is 12 reflows per frame. */
+  background-image: linear-gradient(
+    90deg,
+    #ffffff00 0%,
+    #ffffff14 50%,
+    #ffffff00 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 50% 100%;
+  animation: skel-sweep 1400ms linear infinite;
+  /* Negative delay offsets the phase without holding the first pass back, so
+     neighbouring rows shimmer independently from the very first frame. */
+  animation-delay: calc(var(--skel-i, 0) * -140ms);
+}
+
+@keyframes skel-sweep {
+  from {
+    background-position: -120% 0;
+  }
+  to {
+    background-position: 220% 0;
+  }
+}
+
+/* The numeric columns are right-aligned, and a block-level bar ignores
+   text-align. */
+.skel-row .m-seq .skel-bar,
+.skel-row .m-size .skel-bar {
+  margin-left: auto;
+}
+/* The kind cell is a fixed 26px tile; fill it rather than floating a thin bar
+   inside it. */
+.skel-row .m-kind .skel-bar {
+  height: 100%;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* The blanket rule above only clamps duration and iteration count, which
+     would freeze the sweep mid-pass and leave a bright smear stuck in every
+     bar — that reads as a rendering fault, not as stillness. Placeholders go
+     completely flat instead. */
+  .skel-bar {
+    animation: none !important;
+    background-image: none;
+  }
+}

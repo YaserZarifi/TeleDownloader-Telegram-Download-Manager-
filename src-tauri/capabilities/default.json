@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The minimum TeleWire's window needs: a folder picker for the download root, revealing a finished file in the OS file manager, and opening the my.telegram.org link during first-run setup. Deliberately no filesystem, shell, or HTTP permissions — all Telegram traffic happens in Rust, never in the webview.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:allow-open",
+    "opener:allow-open-url",
+    "opener:allow-reveal-item-in-dir"
+  ]
+}

@@ -1,0 +1,70 @@
+[package]
+name = "telewire"
+version = "1.0.0"
+description = "Telegram direct-link download manager"
+authors = ["TeleWire contributors"]
+license = "MIT"
+edition = "2021"
+# grammers 0.10 crates are edition 2024 internally.
+rust-version = "1.85"
+
+[lib]
+name = "telewire_lib"
+# Desktop-only, so `rlib` alone. Tauri's stock template also emits `cdylib` +
+# `staticlib` for iOS/Android; on the windows-gnu toolchain the cdylib link
+# fails outright ("export ordinal too large") because MinGW's ld can't emit an
+# export table that size. Nothing on desktop consumes those artefacts.
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+
+# --- Telegram -------------------------------------------------------------
+# Pinned to the crates.io 0.10.0 release rather than a git rev. Plan.md §7 says
+# to pin to a commit on GitHub, but that repo was archived in Feb 2026 and its
+# HEAD predates 0.10.0 by five months — the canonical repo is now Codeberg. A
+# published, immutable crates.io version is a stricter pin than a branch and
+# does not depend on a forge staying reachable.
+grammers-client = "=0.10.0"
+grammers-session = "=0.10.0"
+grammers-mtsender = "=0.10.0"
+grammers-tl-types = "=0.10.0"
+
+# --- runtime --------------------------------------------------------------
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "time", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }
+dirs = "5"
+sanitize-filename = "0.5"
+log = "0.4"
+
+# Session secrets never live in plaintext app-data (§10).
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service"] }
+
+[features]
+# Enabled by tauri when building without a custom protocol on mobile.
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+# A download manager is I/O bound, but the chunk reassembly path benefits from
+# real optimisation, and a smaller binary matters for a desktop install.
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
