@@ -211,18 +211,24 @@ fn inflate_stripped_jpeg(stripped: &[u8]) -> Option<Vec<u8>> {
 /// request per tile — so a grid of hundreds of thumbnails costs nothing and
 /// cannot compete with the download engine for bandwidth.
 pub fn thumbnail_for(media: &Media) -> Option<String> {
-    // `Downloadable::to_data` surfaces the stripped bytes for photos, but for
-    // documents (which is what videos are) it stays `None`, so the raw TL
-    // thumb list has to be walked by hand — that is where video previews live.
-    let raw = media.to_data().or_else(|| match media {
-        Media::Document(doc) => stripped_from_document(&doc.raw),
-        Media::Sticker(sticker) => stripped_from_document(&sticker.document.raw),
+    // The raw TL types are walked directly rather than via
+    // `Downloadable::to_data()`: that trait method's default is `None`, and in
+    // practice nothing useful comes back through the `Media` wrapper — which
+    // is why every tile initially fell back to its glyph. Photos keep their
+    // preview in `photo.sizes`; documents (playable videos, GIFs, stickers)
+    // keep theirs in `document.thumbs`. A document uploaded as a plain file
+    // genuinely has no preview, and the glyph fallback is the right answer.
+    let raw = match media {
+        Media::Photo(photo) => inline_from_photo(&photo.raw),
+        Media::Document(doc) => inline_from_document(&doc.raw),
+        Media::Sticker(sticker) => inline_from_document(&sticker.document.raw),
         _ => None,
-    })?;
+    }?;
 
     let jpeg = if raw.first() == Some(&0x01) {
         inflate_stripped_jpeg(&raw)?
     } else if raw.starts_with(&[0xff, 0xd8]) {
+        // `photoCachedSize` carries a complete small JPEG as-is.
         raw
     } else {
         return None;
@@ -230,15 +236,38 @@ pub fn thumbnail_for(media: &Media) -> Option<String> {
     Some(format!("data:image/jpeg;base64,{}", base64_encode(&jpeg)))
 }
 
-/// Pull the `photoStrippedSize` bytes out of a document's thumb list.
-fn stripped_from_document(raw: &tl::types::MessageMediaDocument) -> Option<Vec<u8>> {
+/// Inline preview bytes from a photo's size list, if any variant carries them.
+fn inline_from_photo(raw: &tl::types::MessageMediaPhoto) -> Option<Vec<u8>> {
+    let tl::enums::Photo::Photo(photo) = raw.photo.as_ref()? else {
+        return None;
+    };
+    inline_from_sizes(&photo.sizes)
+}
+
+/// Inline preview bytes from a document's thumb list.
+fn inline_from_document(raw: &tl::types::MessageMediaDocument) -> Option<Vec<u8>> {
     let tl::enums::Document::Document(doc) = raw.document.as_ref()? else {
         return None;
     };
-    doc.thumbs.as_ref()?.iter().find_map(|t| match t {
-        tl::enums::PhotoSize::PhotoStrippedSize(s) => Some(s.bytes.clone()),
-        _ => None,
-    })
+    inline_from_sizes(doc.thumbs.as_ref()?)
+}
+
+/// Prefer the stripped size (universal, ~100 bytes); fall back to a cached
+/// size, which is a complete small JPEG. Everything else in the list is a
+/// server-side size that would cost a network request — not for tiles.
+fn inline_from_sizes(sizes: &[tl::enums::PhotoSize]) -> Option<Vec<u8>> {
+    sizes
+        .iter()
+        .find_map(|t| match t {
+            tl::enums::PhotoSize::PhotoStrippedSize(s) => Some(s.bytes.clone()),
+            _ => None,
+        })
+        .or_else(|| {
+            sizes.iter().find_map(|t| match t {
+                tl::enums::PhotoSize::PhotoCachedSize(s) => Some(s.bytes.clone()),
+                _ => None,
+            })
+        })
 }
 
 /// Minimal base64 encoder. A whole crate for one 30-line function that runs a

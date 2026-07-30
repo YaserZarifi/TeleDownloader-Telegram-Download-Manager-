@@ -391,9 +391,34 @@ async function mountShell(auth: Extract<AuthState, { stage: "ready" }>): Promise
 
 /* --------------------------------------------------------------- channels */
 
+/** Shimmer placeholders shaped like chat rows, reusing the boot skeleton's
+ *  classes (boot.css ships in the main bundle). Listing an account's dialogs
+ *  is a real network round-trip, and a bare "Loading…" string makes the rail
+ *  look broken for exactly the seconds it matters most — right after launch. */
+function railSkeleton(): HTMLElement {
+  const host = el("div", {
+    "aria-hidden": "true",
+    style: "display:flex;flex-direction:column;gap:12px;padding:10px 6px;",
+  });
+  for (let i = 0; i < 10; i++) {
+    host.append(
+      el("div.boot-chan", {}, [
+        el("span.boot-avatar"),
+        el("span.boot-lines", {}, [
+          el("span.boot-bar", { style: `width:${55 + ((i * 13) % 35)}%;height:10px` }),
+          el("span.boot-bar", { style: `width:${26 + ((i * 7) % 24)}%;height:8px` }),
+        ]),
+      ])
+    );
+  }
+  return host;
+}
+
 async function loadChannels(host: HTMLElement): Promise<void> {
-  host.replaceChildren(el("div.field-hint", { style: "padding:12px" }, "Loading channels…"));
+  host.setAttribute("aria-busy", "true");
+  host.replaceChildren(railSkeleton());
   const list = await guard(() => ipc.listDialogs());
+  host.removeAttribute("aria-busy");
   if (!list) {
     host.replaceChildren(el("div.field-hint", { style: "padding:12px" }, "Couldn't load your channels."));
     return;
