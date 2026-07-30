@@ -281,9 +281,16 @@ impl Engine {
 
     /// Snapshot every live job's counters and push one batched event (§11.9).
     async fn progress_loop(self: Arc<Self>) {
-        let mut last_slot: HashMap<String, Vec<u64>> = HashMap::new();
         let mut last_done: HashMap<String, u64> = HashMap::new();
+        // Smoothed rate per job. A 400 ms sampling window over a bursty
+        // network reads as a speed that leaps and collapses; an EMA shows the
+        // figure a person actually wants — "about how fast is this going".
+        let mut smooth: HashMap<String, f64> = HashMap::new();
         let mut last_tick = Instant::now();
+        // True while the previous tick had anything to say. Used to emit one
+        // final all-zero batch when the last transfer ends, so the wire and
+        // the readout settle to idle instead of freezing on stale numbers.
+        let mut was_live = false;
 
         loop {
             tokio::time::sleep(PROGRESS_INTERVAL).await;
@@ -302,31 +309,33 @@ impl Engine {
 
                     let done = live.done.load(Ordering::Relaxed);
                     let prev = last_done.get(id).copied().unwrap_or(done);
-                    let bps = (((done.saturating_sub(prev)) as f64) / dt) as u64;
+                    let inst = (done.saturating_sub(prev)) as f64 / dt;
                     last_done.insert(id.clone(), done);
 
+                    // EMA over ~4 windows. The number a person wants from a
+                    // speed readout is "roughly how fast", and a raw 400 ms
+                    // sample makes it whipsaw between spikes and zero.
+                    let s = smooth.entry(id.clone()).or_insert(inst);
+                    *s = *s * 0.65 + inst * 0.35;
+                    let bps = *s as u64;
+
                     let active = live.active.load(Ordering::Relaxed);
+
+                    // Each bar is a connection's CUMULATIVE haul this transfer,
+                    // relative to the busiest one — so the strip only ever
+                    // fills. An earlier version showed per-tick throughput,
+                    // which refilled from empty every 400 ms and read as the
+                    // download restarting; monotonic is what "progress" means.
                     let slots: Vec<u64> = live
                         .per_slot
                         .iter()
+                        .take(active.max(1) as usize)
                         .map(|a| a.load(Ordering::Relaxed))
                         .collect();
-                    let prev_slots = last_slot.get(id).cloned().unwrap_or_else(|| vec![0; MAX_SLOTS]);
-                    let deltas: Vec<u64> = slots
+                    let peak = slots.iter().copied().max().unwrap_or(0).max(1);
+                    let worker_fill: Vec<f32> = slots
                         .iter()
-                        .zip(prev_slots.iter())
-                        .map(|(now, before)| now.saturating_sub(*before))
-                        .collect();
-                    last_slot.insert(id.clone(), slots);
-
-                    // Each bar is that connection's share of the fastest one —
-                    // a real readout of per-connection throughput, not a
-                    // decorative animation.
-                    let peak = deltas.iter().copied().max().unwrap_or(0).max(1);
-                    let worker_fill: Vec<f32> = deltas
-                        .iter()
-                        .take(active.max(1) as usize)
-                        .map(|d| (*d as f32 / peak as f32).clamp(0.0, 1.0))
+                        .map(|c| (*c as f32 / peak as f32).clamp(0.0, 1.0))
                         .collect();
 
                     let eta_s = if bps > 0 {
@@ -355,9 +364,15 @@ impl Engine {
                 }
             }
 
-            // Emit even when idle-but-recently-active so the wire can settle
-            // back to zero rather than freezing at the last reading.
-            if !entries.is_empty() || total_bps > 0 {
+            // One extra all-zero batch after the last live tick, so the wire
+            // and the "N active" readout settle to idle instead of freezing at
+            // whatever the final live numbers happened to be.
+            let live_now = !entries.is_empty();
+            if live_now || was_live {
+                if !live_now {
+                    last_done.clear();
+                    smooth.clear();
+                }
                 let _ = self.app.emit(
                     EV_PROGRESS,
                     ProgressBatch {
@@ -366,6 +381,7 @@ impl Engine {
                     },
                 );
             }
+            was_live = live_now;
         }
     }
 
@@ -513,8 +529,13 @@ impl Engine {
                 Ok(Outcome::Paused) => rec.job.state = JobState::Paused,
                 Ok(Outcome::Cancelled) => rec.job.state = JobState::Cancelled,
                 Err(e) => {
-                    rec.job.state = JobState::Error;
-                    rec.job.error = Some(format!("{e:#}"));
+                    // A cancel and a worker failure can race; the user's
+                    // explicit action wins over an error they no longer care
+                    // about.
+                    if rec.job.state != JobState::Cancelled {
+                        rec.job.state = JobState::Error;
+                        rec.job.error = Some(format!("{e:#}"));
+                    }
                 }
             }
             rec.job.clone()
@@ -525,23 +546,44 @@ impl Engine {
 
     /* --------------------------------------------------------- controls */
 
+    /// State flips are reflected to the UI *immediately*, not when the workers
+    /// finish draining. Draining can take a couple of seconds (each connection
+    /// finishes its in-flight 512 KiB chunk first), and a button that does
+    /// nothing for that long invites the double-click that restarts the job.
     pub async fn pause(&self, id: &str) -> Result<()> {
-        let jobs = self.jobs.lock().await;
-        let rec = jobs.get(id).ok_or_else(|| anyhow!("No such download."))?;
-        rec.control.paused.store(true, Ordering::SeqCst);
+        let job = {
+            let mut jobs = self.jobs.lock().await;
+            let rec = jobs.get_mut(id).ok_or_else(|| anyhow!("No such download."))?;
+            rec.control.paused.store(true, Ordering::SeqCst);
+            if rec.job.state == JobState::Running {
+                rec.job.state = JobState::Paused;
+                rec.job.speed_bps = 0;
+                rec.job.eta_s = None;
+            }
+            rec.job.clone()
+        };
+        self.emit_job(&job).await;
         Ok(())
     }
 
     pub async fn resume(self: &Arc<Self>, id: &str) -> Result<()> {
-        {
+        let job = {
             let mut jobs = self.jobs.lock().await;
             let rec = jobs.get_mut(id).ok_or_else(|| anyhow!("No such download."))?;
-            if rec.job.state != JobState::Paused && rec.job.state != JobState::Error {
+            // Cancelled is resumable on purpose: the queue shows Retry on a
+            // cancelled row, and the manifest makes a restart cheap anyway.
+            if !matches!(
+                rec.job.state,
+                JobState::Paused | JobState::Error | JobState::Cancelled
+            ) {
                 return Ok(());
             }
             rec.job.state = JobState::Queued;
-        }
-        self.pump().await;
+            rec.job.error = None;
+            rec.job.clone()
+        };
+        self.emit_job(&job).await;
+        self.nudge();
         Ok(())
     }
 
@@ -555,18 +597,20 @@ impl Engine {
             let rec = jobs.get_mut(id).ok_or_else(|| anyhow!("No such download."))?;
             rec.control.cancelled.store(true, Ordering::SeqCst);
             let running = rec.job.state == JobState::Running;
-            if !running {
-                rec.job.state = JobState::Cancelled;
-            }
+            // Reflected immediately either way — the workers still drain in the
+            // background, but the user's click has already landed.
+            rec.job.state = JobState::Cancelled;
+            rec.job.speed_bps = 0;
+            rec.job.eta_s = None;
             (PathBuf::from(&rec.job.dest_path), running, rec.job.clone())
         };
+        self.emit_job(&job).await;
 
         // A running job tears its own partial file down when its workers see
         // the cancel flag; a queued/paused one has no task to do it.
         if !was_running {
             let _ = tokio::fs::remove_file(part_path(&dest)).await;
             let _ = tokio::fs::remove_file(manifest_path(&dest)).await;
-            self.emit_job(&job).await;
         }
         Ok(())
     }

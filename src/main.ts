@@ -275,7 +275,11 @@ async function mountShell(auth: Extract<AuthState, { stage: "ready" }>): Promise
     queuePill,
   ]) as HTMLButtonElement;
 
-  const paneHost = el("div.main#main-region", { role: "main" });
+  // `el()` splits the spec on "." before "#", so the id must ride on the tag
+  // segment: "div#id.class". The other order silently produces a single class
+  // literally named "main#main-region" — no `.main` styles, no flex, and the
+  // file list collapses to zero height. That one character order cost a day.
+  const paneHost = el("div#main-region.main", { role: "main" });
   const tabs = el("div.tabs", { role: "tablist", "aria-label": "Views", style: "max-width:320px" }, [
     tabBrowse,
     tabQueue,

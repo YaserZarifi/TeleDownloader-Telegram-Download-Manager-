@@ -154,7 +154,19 @@ export function createDownloads(opts: {
       title: label,
       html: icon(glyph, 15),
     });
-    b.addEventListener("click", onClick);
+    b.addEventListener("click", () => {
+      // Disarm instantly. The backend acknowledges fast now, but a queue
+      // control must never be double-clickable — a second pause/cancel racing
+      // the first is how downloads get restarted by accident. The state
+      // transition rebuilds the whole action set, which re-enables things;
+      // the timeout is only a safety net for a transition that never comes.
+      if (b.disabled) return;
+      b.disabled = true;
+      setTimeout(() => {
+        b.disabled = false;
+      }, 4000);
+      onClick();
+    });
     return b;
   }
 

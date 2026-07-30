@@ -403,6 +403,11 @@ h3 {
 .rail-head .search {
   max-width: none;
   width: 100%;
+  /* The toolbar search grows via flex-basis, but rail-head is a COLUMN, where
+     a 200px basis becomes 200px of height — the box inflates, its centred
+     icon floats mid-air, and the rail gets a huge dead gap. Pin it. */
+  flex: 0 0 auto;
+  min-width: 0;
 }
 .rail-head .input {
   height: 30px;
@@ -416,8 +421,12 @@ h3 {
   gap: var(--s1);
   overflow-x: auto;
   overflow-y: hidden;
-  scrollbar-width: none;
-  padding-bottom: 2px;
+  /* A visible-but-slim scrollbar, directly under the tabs. The wheel mapping
+     in main.ts covers mouse wheels; this is the affordance that says the strip
+     scrolls at all, and the drag handle for anyone who wants one. */
+  scrollbar-width: thin;
+  scrollbar-color: var(--ink-750) transparent;
+  padding-bottom: 4px;
   margin: 0 calc(-1 * var(--s1));
   /* Fade the edges so a clipped tab reads as "there is more this way" rather
      than as a rendering glitch. The mask is per-edge and toggled from JS via
@@ -439,7 +448,15 @@ h3 {
   --fade-r: #000 calc(100% - 22px), transparent 100%;
 }
 .folders::-webkit-scrollbar {
-  display: none;
+  height: 4px;
+}
+.folders::-webkit-scrollbar-thumb {
+  background: var(--ink-750);
+  border: none;
+  border-radius: 99px;
+}
+.folders:hover::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
 }
 @media (prefers-reduced-motion: reduce) {
   .folders {
@@ -517,6 +534,9 @@ h3 {
 .rail-scroll {
   flex: 1;
   overflow-y: auto;
+  /* Never sideways: a long channel name must ellipsize, not grow a horizontal
+     scrollbar under the whole list. */
+  overflow-x: hidden;
   padding: 0 var(--s2) var(--s3);
 }
 
@@ -1122,8 +1142,12 @@ output.mono {
 /* ---------- 12. Download queue rows ------------------------------------- */
 
 .queue {
-  flex: 1;
+  flex: 1 1 0;
+  /* Without this the queue's own content sets its minimum height, the parent's
+     overflow:hidden clips the excess, and the page cannot scroll at all. */
+  min-height: 0;
   overflow-y: auto;
+  scrollbar-gutter: stable;
   padding: var(--s3) var(--s4) var(--s6);
   display: flex;
   flex-direction: column;

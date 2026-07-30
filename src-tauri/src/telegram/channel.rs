@@ -5,6 +5,7 @@ use grammers_client::media::{Downloadable, Media};
 use grammers_client::peer::Peer;
 use grammers_client::Client;
 use grammers_session::types::PeerRef;
+use grammers_tl_types as tl;
 
 use super::{friendly, Telegram};
 use crate::model::{ChannelInfo, ChatKind, MediaFilter, MediaItem, MediaKind, MediaPage};
@@ -210,7 +211,15 @@ fn inflate_stripped_jpeg(stripped: &[u8]) -> Option<Vec<u8>> {
 /// request per tile — so a grid of hundreds of thumbnails costs nothing and
 /// cannot compete with the download engine for bandwidth.
 pub fn thumbnail_for(media: &Media) -> Option<String> {
-    let raw = media.to_data()?;
+    // `Downloadable::to_data` surfaces the stripped bytes for photos, but for
+    // documents (which is what videos are) it stays `None`, so the raw TL
+    // thumb list has to be walked by hand — that is where video previews live.
+    let raw = media.to_data().or_else(|| match media {
+        Media::Document(doc) => stripped_from_document(&doc.raw),
+        Media::Sticker(sticker) => stripped_from_document(&sticker.document.raw),
+        _ => None,
+    })?;
+
     let jpeg = if raw.first() == Some(&0x01) {
         inflate_stripped_jpeg(&raw)?
     } else if raw.starts_with(&[0xff, 0xd8]) {
@@ -219,6 +228,17 @@ pub fn thumbnail_for(media: &Media) -> Option<String> {
         return None;
     };
     Some(format!("data:image/jpeg;base64,{}", base64_encode(&jpeg)))
+}
+
+/// Pull the `photoStrippedSize` bytes out of a document's thumb list.
+fn stripped_from_document(raw: &tl::types::MessageMediaDocument) -> Option<Vec<u8>> {
+    let tl::enums::Document::Document(doc) = raw.document.as_ref()? else {
+        return None;
+    };
+    doc.thumbs.as_ref()?.iter().find_map(|t| match t {
+        tl::enums::PhotoSize::PhotoStrippedSize(s) => Some(s.bytes.clone()),
+        _ => None,
+    })
 }
 
 /// Minimal base64 encoder. A whole crate for one 30-line function that runs a

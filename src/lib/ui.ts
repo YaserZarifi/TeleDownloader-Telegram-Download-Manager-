@@ -7,16 +7,30 @@ import { icon } from "./icons";
 type Attrs = Record<string, string | number | boolean | null | undefined>;
 
 /**
- * el("div.job[data-state=running]", attrs?, children?)
- * Tag syntax: `tag.class.class#id`. Attributes go in the second argument.
+ * el("div#id.class.class", attrs?, children?)
+ *
+ * The spec is split on "." FIRST, then the id is taken from the tag segment —
+ * so an id must be written before any class ("div#id.cls"), never after one
+ * ("div.cls#id" would yield a class literally named "cls#id"). Attributes go
+ * in the second argument.
  */
 export function el<K extends keyof HTMLElementTagNameMap>(
   spec: string,
   attrs?: Attrs,
   children?: Array<Node | string | null | undefined> | string
 ): HTMLElementTagNameMap[K] {
-  const [head, ...classes] = spec.split(".");
-  const [tag, id] = head.split("#");
+  // Tolerate an id in any segment ("div.cls#id" as well as "div#id.cls").
+  // The strict split-on-dot-first parse once produced an element whose single
+  // class was literally "main#main-region" — no styles matched and the layout
+  // silently collapsed, which took a headless-browser session to find.
+  const segments = spec.split(".");
+  let [tag, id] = segments[0].split("#");
+  const classes: string[] = [];
+  for (const seg of segments.slice(1)) {
+    const [cls, segId] = seg.split("#");
+    if (cls) classes.push(cls);
+    if (segId) id = segId;
+  }
   const node = document.createElement(tag || "div");
   if (id) node.id = id;
   if (classes.length) node.className = classes.join(" ");
