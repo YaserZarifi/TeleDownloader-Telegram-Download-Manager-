@@ -197,6 +197,14 @@ on first launch until code-signing certificates are set up.
 
 ---
 
+## Credits
+
+Developed by **Yaser Zarifi**.
+
+- Project repository: <https://github.com/YaserZarifi/TeleDownloader-Telegram-Download-Manager->
+- GitHub: <https://github.com/YaserZarifi>
+- LinkedIn: <https://www.linkedin.com/in/mohammad-yaser-zarifi/>
+
 ## License
 
 MIT — see [LICENSE](LICENSE). Compatible with `grammers`' MIT/Apache-2.0 dual

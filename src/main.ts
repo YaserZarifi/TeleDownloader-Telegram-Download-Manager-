@@ -50,6 +50,7 @@ let railQuery = "";
 /** Active folder tab. "all" shows every chat, grouped by kind. */
 let railFolder: ChatKind | "all" = "all";
 let railFolderStrip: HTMLElement | null = null;
+let railFolderFades: (() => void) | null = null;
 /** Which channel the browser is showing, so the rail can survive re-renders. */
 let selectedChannelId: number | null = null;
 let settings: Settings | null = null;
@@ -197,8 +198,40 @@ async function mountShell(auth: Extract<AuthState, { stage: "ready" }>): Promise
 
   // Telegram-style folder tabs. A horizontally scrolling strip rather than a
   // wrapping row, so a narrow rail never turns into three lines of chrome.
-  const folderStrip = el("div.folders", { role: "tablist", "aria-label": "Chat folders" });
+  // Explicit type argument: `el`'s tag parameter can't be inferred from a
+  // string, so without it the return type is a union of every element and
+  // `addEventListener("wheel", …)` won't resolve to the WheelEvent overload.
+  const folderStrip = el<"div">("div.folders", {
+    role: "tablist",
+    "aria-label": "Chat folders",
+  });
   railFolderStrip = folderStrip;
+
+  // A vertical wheel does nothing to a horizontally-scrolling strip, so tabs
+  // past the edge felt unreachable even though the container did scroll.
+  // Translate wheel movement onto the horizontal axis.
+  folderStrip.addEventListener(
+    "wheel",
+    (e: WheelEvent) => {
+      const delta = Math.abs(e.deltaY) > Math.abs(e.deltaX) ? e.deltaY : e.deltaX;
+      if (!delta) return;
+      const max = folderStrip.scrollWidth - folderStrip.clientWidth;
+      if (max <= 0) return;
+      e.preventDefault();
+      folderStrip.scrollLeft += delta;
+    },
+    { passive: false }
+  );
+
+  // Show a fade only on the side that is actually cut off.
+  const syncFolderFades = () => {
+    const max = folderStrip.scrollWidth - folderStrip.clientWidth;
+    folderStrip.dataset.overflowLeft = String(folderStrip.scrollLeft > 2);
+    folderStrip.dataset.overflowRight = String(folderStrip.scrollLeft < max - 2);
+  };
+  folderStrip.addEventListener("scroll", syncFolderFades, { passive: true });
+  new ResizeObserver(syncFolderFades).observe(folderStrip);
+  railFolderFades = syncFolderFades;
 
   const rail = el("nav.rail", {}, [
     el("div.rail-head", {}, [railSearchBox, folderStrip]),
@@ -380,9 +413,13 @@ function renderFolders(host: HTMLElement): void {
       railFolder = f.id;
       renderFolders(host);
       renderChannels(must(".rail-scroll"));
+      // Bring a partly-clipped tab fully into view once it becomes the
+      // selection, so the active folder is never the one hidden by a fade.
+      tab.scrollIntoView({ block: "nearest", inline: "nearest" });
     });
     host.append(tab);
   }
+  railFolderFades?.();
 }
 
 function renderChannels(host: HTMLElement): void {
@@ -676,7 +713,13 @@ async function refreshJobs(): Promise<void> {
 async function enqueue(channelId: number, messageIds: number[]): Promise<void> {
   const created = await guard(() => ipc.enqueueDownload(channelId, messageIds));
   if (!created) return;
-  for (const j of created) jobs.set(j.id, j);
+  // Insert only what we haven't already heard about. The command's return
+  // value is a snapshot taken at creation time (state "queued"), but the
+  // backend starts the job and emits the "running" event before the call even
+  // resolves — writing the snapshot over that would roll the row back to
+  // queued, which is why running transfers were showing the queued action set
+  // (cancel only, no pause). Events are always the fresher source.
+  for (const j of created) if (!jobs.has(j.id)) jobs.set(j.id, j);
   downloads?.render([...jobs.values()]);
   browser?.setJobStates(jobStateIndex());
   toast(

@@ -13,6 +13,34 @@ import * as ipc from "../lib/ipc";
 import { icon } from "../lib/icons";
 import { el, modal, toast } from "../lib/ui";
 
+/** External link that opens in the OS browser, never inside the webview. */
+function extLink(label: string, url: string): HTMLElement {
+  const a = el("button.credit-link", { type: "button", title: url }, [
+    el("span", {}, label),
+    el("span", { html: icon("external", 12) }),
+  ]);
+  a.addEventListener("click", () => {
+    ipc.openUrl(url).catch(() => toast(`Couldn't open ${url}`, "error"));
+  });
+  return a;
+}
+
+function creditsBlock(): HTMLElement {
+  return el("div.credits", {}, [
+    el("div.eyebrow", {}, "About"),
+    el("p.credit-line", {}, [
+      el("span", {}, "TeleWire — built by "),
+      el("b", {}, "Yaser Zarifi"),
+      el("span", {}, ". MIT licensed, no telemetry, no server."),
+    ]),
+    el("div.credit-links", {}, [
+      extLink("Project repository", "https://github.com/YaserZarifi/TeleDownloader-Telegram-Download-Manager-"),
+      extLink("GitHub", "https://github.com/YaserZarifi"),
+      extLink("LinkedIn", "https://www.linkedin.com/in/mohammad-yaser-zarifi/"),
+    ]),
+  ]);
+}
+
 export function openSettings(current: Settings, onSaved: (next: Settings) => void): void {
   const draft: Settings = { ...current };
 
@@ -121,6 +149,8 @@ export function openSettings(current: Settings, onSaved: (next: Settings) => voi
         "Separate from connections-per-file. Three simultaneous files at eight connections each is already twenty-four open range-fetches."
       ),
     ]),
+
+    creditsBlock(),
 
     el("div.modal-foot", {}, [cancel, save]),
   ]);

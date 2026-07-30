@@ -3,6 +3,8 @@ dist/
 src-tauri/target/
 src-tauri/gen/
 
+CLAUDE.md
+Plan.md
 
 *.session
 telewire.session

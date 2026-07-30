@@ -345,6 +345,15 @@ h3 {
   display: grid;
   grid-template-columns: var(--rail-w) 1fr;
   min-height: 0;
+  overflow: hidden;
+}
+/* Grid items default to `min-height: auto`, which lets a tall child push the
+   row past the viewport instead of scrolling inside it. Every link in the
+   chain from #app down to .manifest-viewport has to opt out, or the file list
+   grows to its full content height and there is nothing left to scroll. */
+.workspace > * {
+  min-height: 0;
+  min-width: 0;
 }
 
 .rail {
@@ -410,9 +419,32 @@ h3 {
   scrollbar-width: none;
   padding-bottom: 2px;
   margin: 0 calc(-1 * var(--s1));
+  /* Fade the edges so a clipped tab reads as "there is more this way" rather
+     than as a rendering glitch. The mask is per-edge and toggled from JS via
+     data attributes, so the fade only appears on the side that is actually
+     overflowing. */
+  --fade-l: transparent 0, #000 0;
+  --fade-r: #000 calc(100% - 0px), transparent 100%;
+  -webkit-mask-image: linear-gradient(90deg, var(--fade-l)),
+    linear-gradient(90deg, var(--fade-r));
+  -webkit-mask-composite: source-in;
+  mask-image: linear-gradient(90deg, var(--fade-l)), linear-gradient(90deg, var(--fade-r));
+  mask-composite: intersect;
+  scroll-behavior: smooth;
+}
+.folders[data-overflow-left="true"] {
+  --fade-l: transparent 0, #000 22px;
+}
+.folders[data-overflow-right="true"] {
+  --fade-r: #000 calc(100% - 22px), transparent 100%;
 }
 .folders::-webkit-scrollbar {
   display: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .folders {
+    scroll-behavior: auto;
+  }
 }
 .folder {
   display: inline-flex;
@@ -498,13 +530,16 @@ h3 {
   flex-direction: column;
   min-height: 0;
   min-width: 0;
+  overflow: hidden;
 }
 
 /* Views root themselves at `.main` so they work standalone; when one is
-   mounted inside the shell's pane host it has to claim the leftover height,
-   or nested flex columns collapse to their content. */
+   mounted inside the shell's pane host it has to claim the leftover height.
+   `flex-basis: 0` rather than `auto` on purpose — with `auto` the item's base
+   size is its content height, and a 114-row list makes that taller than the
+   window. */
 .main > .main {
-  flex: 1 1 auto;
+  flex: 1 1 0;
   min-height: 0;
 }
 
@@ -866,9 +901,13 @@ output.mono {
   border-bottom: 1px solid var(--line);
   background: var(--ink-900);
   flex: none;
+  /* Wrap rather than crushing the search box to an icon when the title, tabs
+     and action button all compete for the same row. */
+  flex-wrap: wrap;
 }
 .toolbar-title {
   min-width: 0;
+  flex: 0 1 auto;
 }
 .toolbar-title h2 {
   white-space: nowrap;
@@ -880,13 +919,29 @@ output.mono {
   font-size: 11px;
   color: var(--text-faint);
 }
+/* The search box must never shrink below "you can read what you typed".
+   `flex: 1` alone let the tabs and the download button squeeze it down to the
+   width of its own magnifier icon. A floor plus a grow-on-focus keeps it
+   compact when idle and generous while in use. */
 .search {
   position: relative;
-  flex: 1;
-  max-width: 320px;
+  flex: 1 1 200px;
+  min-width: 168px;
+  max-width: 300px;
+  transition: max-width var(--dur-slow) var(--ease), flex-basis var(--dur-slow) var(--ease);
+}
+.search:focus-within {
+  flex-basis: 380px;
+  max-width: 460px;
 }
 .search .input {
   padding-left: 32px;
+  width: 100%;
+}
+/* Kill the proprietary clear button: it sits under our own layout and looks
+   nothing like the rest of the app. */
+.search .input::-webkit-search-cancel-button {
+  appearance: none;
 }
 .search svg {
   position: absolute;
@@ -929,10 +984,13 @@ output.mono {
 }
 
 .manifest-viewport {
-  flex: 1;
+  flex: 1 1 0;
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
+  /* The scrollbar is the only cue that there is more below, so keep it
+     permanently visible rather than letting the OS auto-hide it. */
+  scrollbar-gutter: stable;
   position: relative;
   /* `layout paint`, NOT `strict`. `strict` adds size containment, which makes
      this element size itself as though it had no contents — combined with the
@@ -1627,4 +1685,206 @@ output.mono {
     animation: none !important;
     background-image: none;
   }
+}
+
+/* ---------- 19. Manifest selection checkboxes --------------------------- */
+/* Batch download is older than this section: ctrl/shift-click already built a
+   selection and the toolbar button already enqueued it. What was missing was
+   any *sign* that it could be done — an invisible feature is not a feature —
+   so the manifest grows an explicit leading column.
+
+   The grid itself is declared in §11 and re-cut for narrow windows in §16.
+   Both are re-declared below rather than edited in place, which is why this
+   section has to stay last in the file: specificity is identical to the
+   originals, so these rules win on source order alone. For the same reason
+   the two media queries have to be repeated in full even though only their
+   first track is new — and they have to come *after* the base rule here, or
+   the base rule (being later) would beat them at every width.
+
+   Head and row share the grid, so both grew a cell; §18's skeleton rows carry
+   `.media-row` and grew one too (see skelRow in browser.ts). The columns the
+   media queries drop are unchanged, so the counts still line up: 8 tracks
+   above 1100px, 7 below it, 5 below 720px. */
+
+.manifest-head,
+.media-row {
+  grid-template-columns: 24px 52px 32px minmax(0, 1fr) 88px 96px 128px 44px;
+}
+
+@media (max-width: 1100px) {
+  .manifest-head,
+  .media-row {
+    grid-template-columns: 24px 44px 32px minmax(0, 1fr) 84px 112px 44px;
+  }
+}
+
+@media (max-width: 720px) {
+  .manifest-head,
+  .media-row {
+    grid-template-columns: 24px 32px minmax(0, 1fr) 80px 44px;
+  }
+}
+
+/* The cell, not the 15px box, is the click target: stretched to the full row
+   it gives a 24x44 hit area, which is the difference between a checkbox you
+   can hit and one you have to aim at. */
+.m-check {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  align-self: stretch;
+  cursor: pointer;
+}
+/* §11 clips every head cell for its ellipsis; that clip would also eat the
+   focus ring on the select-all box, which is the one control here that is a
+   tab stop. Nothing in this cell can overflow anyway. */
+.manifest-head > .m-check {
+  overflow: visible;
+}
+
+/* A native checkbox is the one control the platform styles in its own accent
+   colour, which would put a stray blue tick in an amber-and-cyan instrument
+   panel. `appearance: none` hands it back, and everything below rebuilds it
+   from the same tokens as the buttons and inputs. */
+.cbx {
+  appearance: none;
+  -webkit-appearance: none;
+  flex: none;
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  background-color: var(--ink-950);
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: 15px 15px;
+  cursor: pointer;
+  transition:
+    background-color var(--dur-fast) var(--ease),
+    border-color var(--dur-fast) var(--ease);
+}
+.cbx:hover {
+  border-color: var(--amber-dim);
+}
+
+/* The tick and the dash are inline SVG data URIs rather than a font glyph or
+   an emoji: they ship with the stylesheet, need no network and no icon set,
+   and stay crisp at any zoom. The stroke is hard-coded to the value of
+   --text-on-amber — a data URI is a separate document and cannot read custom
+   properties — so it must be changed here if that token ever moves. */
+.cbx:checked {
+  background-color: var(--amber);
+  border-color: var(--amber);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3.5 8.4l3 3 5.8-6' fill='none' stroke='%231a1204' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+/* "Some, but not all" — the select-all box only. A dash, not a smaller tick:
+   it has to read as a different answer, not as a weaker yes. */
+.cbx:indeterminate {
+  background-color: var(--amber);
+  border-color: var(--amber);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.2 8h7.6' fill='none' stroke='%231a1204' stroke-width='2.2' stroke-linecap='round'/%3E%3C/svg%3E");
+}
+.cbx:checked:hover,
+.cbx:indeterminate:hover {
+  background-color: var(--amber-hi);
+  border-color: var(--amber-hi);
+}
+
+/* Same ring as every other control (§2 sets it globally, but the row boxes are
+   tabindex="-1" and sit inside a scroll container, so it is worth being
+   explicit that they still show one when focus reaches them). */
+.cbx:focus-visible {
+  box-shadow: var(--focus);
+}
+
+/* Unlike the row's download button (§11), the box never fades out on an
+   unhovered row — a control that only appears on hover is exactly the
+   discoverability problem this column exists to fix. */
+.media-row .m-check .cbx {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* §17 already clamps the duration; killing the transition outright also
+     stops the colour fade from being interpolated at all, so checking a box
+     is an instant state change rather than a 1ms crossfade. */
+  .cbx {
+    transition: none;
+  }
+}
+
+/* ---------- 20. Connecting phase ---------------------------------------- */
+/* A running transfer that has not yet received a byte: opening connections,
+   refreshing the file reference, possibly copying authorization to another
+   data center. Without this the bar sits dead at 0 B/s and reads as hung. */
+
+.job[data-phase="connecting"] .bar-fill {
+  width: 34% !important;
+  background: linear-gradient(90deg, transparent, var(--amber-dim), transparent);
+  animation: bar-sweep 1400ms linear infinite;
+}
+@keyframes bar-sweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(340%);
+  }
+}
+.job[data-phase="connecting"] .job-stats b,
+.job[data-phase="connecting"] .job-stats .spd {
+  color: var(--cyan);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .job[data-phase="connecting"] .bar-fill {
+    animation: none;
+    width: 100% !important;
+    background: var(--amber-dim);
+    opacity: 0.4;
+  }
+}
+
+/* ---------- 21. Credits -------------------------------------------------- */
+
+.credits {
+  margin-top: var(--s5);
+  padding-top: var(--s4);
+  border-top: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+}
+.credit-line {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+.credit-line b {
+  color: var(--text);
+  font-weight: 600;
+}
+.credit-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s2);
+}
+.credit-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 var(--s3);
+  border: 1px solid var(--line);
+  border-radius: 99px;
+  background: var(--ink-950);
+  color: var(--cyan);
+  font-size: 11.5px;
+  transition: border-color var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
+}
+.credit-link:hover {
+  border-color: var(--cyan-dim);
+  color: var(--cyan-hi);
 }

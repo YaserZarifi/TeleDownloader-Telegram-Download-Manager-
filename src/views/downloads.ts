@@ -58,6 +58,8 @@ interface JobRow {
   vSpd: string;
   vEta: string;
   vConns: string;
+  /** "connecting" while a running job has yet to receive its first byte. */
+  vPhase: string;
   vWorkers: string[];
 }
 
@@ -208,6 +210,7 @@ export function createDownloads(opts: {
       vSpd: "",
       vEta: "",
       vConns: "",
+      vPhase: "",
       vWorkers: [],
     };
   }
@@ -255,6 +258,19 @@ export function createDownloads(opts: {
     workers: number,
     workerFill: number[]
   ): void {
+    // Opening connections, resolving the file location and (for a file on
+    // another data center) copying the authorization all happen before the
+    // first byte lands. On a big file that is several seconds of a bar sitting
+    // at 0 B/s, which reads as "stuck". Flag the phase so the row can say
+    // "Connecting…" and run an indeterminate bar instead of a dead one.
+    const phase =
+      row.state === "running" && done === 0 && bps === 0 ? "connecting" : "";
+    if (row.vPhase !== phase) {
+      row.vPhase = phase;
+      if (phase) row.node.dataset.phase = phase;
+      else delete row.node.dataset.phase;
+    }
+
     const w = `${(percent(done, row.size) * 100).toFixed(2)}%`;
     if (row.vFill !== w) {
       row.vFill = w;
@@ -265,7 +281,7 @@ export function createDownloads(opts: {
       row.vSizes = sizes;
       row.sizes.textContent = sizes;
     }
-    const s = speed(bps);
+    const s = phase === "connecting" ? "Connecting…" : speed(bps);
     if (row.vSpd !== s) {
       row.vSpd = s;
       row.spd.textContent = s;

@@ -67,6 +67,7 @@ export interface BrowserView {
  *  keeps a scroll frame down to the handful of cells that actually changed. */
 interface Row {
   node: HTMLElement;
+  check: HTMLInputElement;
   seq: HTMLElement;
   kind: HTMLElement;
   name: HTMLElement;
@@ -124,7 +125,11 @@ export function createBrowser(opts: {
   let jobStates: Map<string, JobState> = new Map();
 
   const selected = new Set<number>(); // message ids
-  let anchor = -1; // view index that shift+click ranges from
+  // View index that a shift-click ranges from. Both the row body and the row
+  // checkbox move it, so shift-extending works across the two the way it does
+  // in a file manager — the anchor is "the last row you acted on", not "the
+  // last row you clicked in one particular spot".
+  let anchor = -1;
   let focusIdx = -1; // view index of the roving keyboard focus
 
   /** Cached so neither the scroll handler nor the render loop reads layout. */
@@ -188,11 +193,22 @@ export function createBrowser(opts: {
 
   /* ---------- manifest --------------------------------------------------- */
 
-  /* The head and a row share one 7-column grid, so the head must emit exactly
-     seven children in row order. The three columns the responsive rules drop
+  /* The select-all box. Unlike the per-row boxes this one is a real tab stop:
+     one stop for the whole grid is cheap, and it is the only way to reach
+     batch selection from the keyboard without arrowing down the whole list.
+     Its checked / indeterminate state and its accessible name are both derived
+     from `view` in syncChrome() — see there for why the scope matters. */
+  const selectAll = el<"input">("input.cbx", {
+    type: "checkbox",
+    "aria-label": "Select all loaded files",
+  });
+
+  /* The head and a row share one 8-column grid, so the head must emit exactly
+     eight children in row order. The three columns the responsive rules drop
      (`.m-seq`, `.m-date`, `.m-status`) carry those classes here too, otherwise
-     the head would keep seven children in a four-column grid below 720px. */
+     the head would keep eight children in a five-column grid below 720px. */
   const head = el<"div">("div.manifest-head", {}, [
+    el<"span">("span.m-check", {}, [selectAll]),
     el<"span">("span.m-seq", { text: "#" }),
     el<"span">("span", { "aria-hidden": "true" }),
     el<"span">("span", { text: "Name" }),
@@ -285,6 +301,10 @@ export function createBrowser(opts: {
       "div.media-row.skel-row",
       { "aria-hidden": "true", style: `--skel-i:${i % 6}` },
       [
+        // Empty, like `.m-action`: a shimmering bar where a checkbox will be
+        // would read as a control that cannot be clicked yet. The cell still
+        // has to exist so the columns line up with the real rows.
+        el<"span">("span.m-check"),
         el<"span">("span.m-seq", {}, [skelBar("58%")]),
         el<"span">("span.m-kind", {}, [skelBar("100%")]),
         el<"span">("span.m-name", {}, [skelBar(`${w}%`)]),
@@ -467,6 +487,15 @@ export function createBrowser(opts: {
   /* ---------- rows ------------------------------------------------------- */
 
   function makeRow(): Row {
+    // `tabindex="-1"` on purpose: a tab stop per row would mean thousands of
+    // stops in a manifest, so the box is driven by Space on the focused row
+    // (see onKeyDown) and by clicking the cell. `data-check` marks the whole
+    // cell — not just the 15px box — as the hit target, which is what makes it
+    // comfortable to click; the accessible name is filled in by paint().
+    const check = el<"input">("input.cbx", { type: "checkbox", tabindex: "-1" });
+    const checkCell = el<"span">("span.m-check", { role: "gridcell", "data-check": "" }, [
+      check,
+    ]);
     const seq = el<"span">("span.m-seq", { role: "gridcell" });
     const kind = el<"span">("span.m-kind", { role: "gridcell" });
     const name = el<"span">("span.m-name", { role: "gridcell" });
@@ -482,10 +511,11 @@ export function createBrowser(opts: {
     const node = el<"div">(
       "div.media-row",
       { role: "row", tabindex: "0", "data-selected": "false", "aria-selected": "false" },
-      [seq, kind, name, size, when, status, action]
+      [checkCell, seq, kind, name, size, when, status, action]
     );
     return {
       node,
+      check,
       seq,
       kind,
       name,
@@ -547,6 +577,9 @@ export function createBrowser(opts: {
         dl.setAttribute("aria-label", `Download ${item.name}`);
         dl.setAttribute("title", `Download ${item.name}`);
       }
+      // The box has no visible label of its own, so it borrows the filename.
+      // setAttribute, never innerHTML — this string is Telegram's.
+      r.check.setAttribute("aria-label", `Select ${item.name}`);
     }
     if (r.vSize !== item.size) {
       r.vSize = item.size;
@@ -568,6 +601,11 @@ export function createBrowser(opts: {
       r.vSelected = sel;
       r.node.dataset.selected = String(sel);
       r.node.setAttribute("aria-selected", String(sel));
+      // paint() is the *only* writer of `.checked`, which is what keeps a
+      // recycled row from carrying a stale tick: `vSelected` and the DOM are
+      // written together or not at all. That invariant is also why the click
+      // handler cancels the browser's own toggle — see onClick.
+      r.check.checked = sel;
     }
   }
 
@@ -614,11 +652,25 @@ export function createBrowser(opts: {
     viewport.setAttribute("aria-rowcount", String(view.length));
     if (focusIdx >= view.length) focusIdx = -1;
     unmountAll();
+    // The select-all box describes `view`, so a change to `view` changes it
+    // even though nothing was selected or deselected — typing in the search
+    // box can turn "some" into "all" without the user touching a row.
+    syncChrome();
     syncBody();
     render();
   }
 
   /* ---------- toolbar chrome --------------------------------------------- */
+
+  /** How many rows of the current `view` are selected. Linear, but only ever
+   *  walked when something is selected at all — which keeps it off the paging
+   *  path, where this would otherwise run once per arriving page. */
+  function selectedInView(): number {
+    if (selected.size === 0) return 0;
+    let n = 0;
+    for (const it of view) if (selected.has(it.message_id)) n++;
+    return n;
+  }
 
   function syncChrome(): void {
     titleEl.textContent = channel ? channel.title : "No channel selected";
@@ -638,14 +690,29 @@ export function createBrowser(opts: {
       const pill = pills.get(f.id);
       const tab = tabs.get(f.id);
       if (!pill || !tab) continue;
+      // While the "All" tab is loaded, every per-type count is already
+      // derivable from the items in hand — each one carries its `kind`. Doing
+      // that here means the type tabs show a real number straight away instead
+      // of a dash that only resolves once the user clicks and triggers a fresh
+      // scan. Still a floor while paging, hence the "+".
+      const derived =
+        filter === "all" && f.id !== "all" && items.length
+          ? items.reduce((n, it) => n + (it.kind === f.id ? 1 : 0), 0)
+          : null;
+
       const known = counts.get(f.id);
+      const loadedAll = filter === "all" && nextOffset === null;
       // "1234+" while paging: the loaded count is a floor, not the total.
       const text =
         known != null
           ? String(known)
-          : f.id === filter && items.length
-            ? `${items.length}+`
-            : "—";
+          : derived != null
+            ? loadedAll
+              ? String(derived)
+              : `${derived}+`
+            : f.id === filter && items.length
+              ? `${items.length}+`
+              : "—";
       if (pill.textContent !== text) pill.textContent = text;
       pill.dataset.active = String(f.id === filter);
       tab.setAttribute("aria-selected", String(f.id === filter));
@@ -653,6 +720,22 @@ export function createBrowser(opts: {
 
     dlBtn.hidden = selected.size === 0;
     dlLabel.textContent = `Download ${selected.size}`;
+
+    /* Tri-state select-all. It is derived from `view`, not `items`, and not
+       from `selected` — `selected` can hold ids the search box is currently
+       hiding, and `items` can only ever be a prefix of a channel that is still
+       paging. The box therefore promises exactly what its click delivers: the
+       rows on screen right now. The name says "loaded" for the same reason —
+       "select all" over an unbounded history would be a lie. */
+    const inView = selectedInView();
+    const all = view.length > 0 && inView === view.length;
+    selectAll.checked = all;
+    // Property, not attribute: `indeterminate` has no HTML attribute at all.
+    selectAll.indeterminate = inView > 0 && !all;
+    const scope = query.trim() ? "matching loaded" : "loaded";
+    const plural = view.length === 1 ? "" : "s";
+    selectAll.setAttribute("aria-label", `Select all ${view.length} ${scope} file${plural}`);
+    selectAll.title = `Selects the ${view.length} ${scope} file${plural} in this list. Files further back in this channel's history have not been loaded yet.`;
   }
 
   /* ---------- paging ----------------------------------------------------- */
@@ -755,6 +838,32 @@ export function createBrowser(opts: {
     }
   }
 
+  /**
+   * Checkbox-style toggle: additive, never replacing. This is the difference
+   * between the box and the row body — clicking a row means "I want this one",
+   * clicking a box means "…and this one too", so it must not clear anything.
+   *
+   * With `extend`, every row between the anchor and `index` is driven to the
+   * state the clicked row is about to take, which is what shift-clicking a
+   * checkbox does in a file manager: shift-checking fills the range in,
+   * shift-unchecking empties it, and neither disturbs rows outside it.
+   */
+  function toggleAt(index: number, extend: boolean): void {
+    const item = view[index];
+    if (!item) return;
+    const on = !selected.has(item.message_id);
+    const lo = extend && anchor >= 0 ? Math.min(anchor, index) : index;
+    const hi = extend && anchor >= 0 ? Math.max(anchor, index) : index;
+    for (let i = lo; i <= hi; i++) {
+      const it = view[i];
+      if (!it) continue;
+      if (on) selected.add(it.message_id);
+      else selected.delete(it.message_id);
+    }
+    anchor = index;
+    focusIdx = index;
+  }
+
   function focusRow(index: number): void {
     if (index < 0 || index >= view.length) return;
     focusIdx = index;
@@ -786,6 +895,23 @@ export function createBrowser(opts: {
     if (e.target instanceof Element && e.target.closest("[data-dl]")) {
       e.stopPropagation();
       enqueue([item.message_id]);
+      return;
+    }
+
+    // The checkbox cell. This handler is delegated, so the row's own
+    // select/ctrl/shift logic below is skipped by returning early rather than
+    // by stopping propagation; stopPropagation is still called so the click
+    // does not escape the grid to any ancestor listener.
+    if (e.target instanceof Element && e.target.closest("[data-check]")) {
+      e.stopPropagation();
+      // Cancels the browser's own toggle so paint() stays the single writer of
+      // `.checked`. Without this a shift-click that leaves a row selected would
+      // desync forever: the box would have flipped itself off, while paint()
+      // compares against `vSelected`, sees no change, and never writes it back.
+      e.preventDefault();
+      toggleAt(index, e.shiftKey);
+      syncChrome();
+      render();
       return;
     }
 
@@ -829,11 +955,24 @@ export function createBrowser(opts: {
       focusRow(next);
       return;
     }
-    if (e.key === "Enter" || e.key === " ") {
+    // Space toggles, Enter downloads — the split the checkbox makes necessary,
+    // and the one a file manager already trains. preventDefault does double
+    // duty: Space would otherwise page the viewport, and when focus is sitting
+    // on a row's checkbox (a click puts it there) it would also let the box
+    // toggle itself, which is the one path that could get ahead of `selected`.
+    if (e.key === " ") {
+      if (focusIdx < 0) return;
+      e.preventDefault();
+      toggleAt(focusIdx, e.shiftKey);
+      syncChrome();
+      render();
+      return;
+    }
+    if (e.key === "Enter") {
       if (focusIdx < 0) return;
       const item = view[focusIdx];
       if (!item) return;
-      e.preventDefault(); // Space would otherwise page the viewport
+      e.preventDefault();
       enqueue([item.message_id]);
     }
   };
@@ -872,6 +1011,22 @@ export function createBrowser(opts: {
     enqueue([...selected]);
   };
 
+  /* Acts on `view` — the loaded, filtered rows the box reports on — and never
+     on `items` or on history that has not been paged in. Clearing likewise
+     only drops what is on screen, so a selection made before a search phrase
+     was typed survives clearing the filtered rows. syncChrome() re-derives the
+     box afterwards, so the browser's own toggle needs no cancelling here. */
+  const onSelectAll = (): void => {
+    const on = selectedInView() < view.length;
+    for (const it of view) {
+      if (on) selected.add(it.message_id);
+      else selected.delete(it.message_id);
+    }
+    anchor = view.length > 0 ? 0 : -1;
+    syncChrome();
+    render();
+  };
+
   const ro = new ResizeObserver((entries) => {
     const h = entries[0]?.contentRect.height ?? 0;
     if (h === viewportH) return;
@@ -887,6 +1042,9 @@ export function createBrowser(opts: {
   searchInput.addEventListener("input", onSearch);
   tabsEl.addEventListener("click", onTabs);
   dlBtn.addEventListener("click", onDownload);
+  // `change`, not `click`: it covers Space on the focused box too, and it is
+  // not fired by the programmatic writes in syncChrome().
+  selectAll.addEventListener("change", onSelectAll);
   ro.observe(viewport);
 
   /* ---------- lifecycle -------------------------------------------------- */
@@ -948,6 +1106,7 @@ export function createBrowser(opts: {
       searchInput.removeEventListener("input", onSearch);
       tabsEl.removeEventListener("click", onTabs);
       dlBtn.removeEventListener("click", onDownload);
+      selectAll.removeEventListener("change", onSelectAll);
       ro.disconnect();
       unmountAll();
       pool.length = 0;

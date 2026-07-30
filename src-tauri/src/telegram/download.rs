@@ -40,10 +40,10 @@ use grammers_client::{Client, InvocationError};
 use grammers_session::types::PeerRef;
 use grammers_tl_types as tl;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -120,6 +120,51 @@ async fn save_manifest(dest: &Path, size: u64, done: &[u32]) -> Result<()> {
     })?;
     tokio::fs::write(&tmp, text).await?;
     tokio::fs::rename(&tmp, &mpath).await?;
+    Ok(())
+}
+
+/* ------------------------------------------------------- DC migration */
+
+/// Data centers this process has already copied its authorization to.
+///
+/// Large files frequently live on a different DC than the account's home one.
+/// Telegram answers `upload.getFile` for those with `FILE_MIGRATE_X`, and the
+/// connection to DC X starts out unauthenticated — asking it for the file
+/// again would just yield `AUTH_KEY_UNREGISTERED`. The fix is to export an
+/// authorization from the home DC and import it there, once per DC per
+/// process. grammers does this internally for its own downloader, but
+/// `copy_auth_to_dc` is `pub(crate)`, so the engine has to do it itself.
+static DC_AUTH: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+
+async fn ensure_dc_auth(client: &Client, dc_id: i32) -> Result<()> {
+    let done = DC_AUTH.get_or_init(|| Mutex::new(HashSet::new()));
+    // The lock is held across the round-trip deliberately: two workers hitting
+    // the same migration simultaneously should produce one import, not a race.
+    let mut done = done.lock().await;
+    if done.contains(&dc_id) {
+        return Ok(());
+    }
+
+    let exported = client
+        .invoke(&tl::functions::auth::ExportAuthorization { dc_id })
+        .await
+        .map_err(|e| anyhow!(friendly(&e.to_string())))
+        .with_context(|| format!("exporting authorization for DC {dc_id}"))?;
+    let tl::enums::auth::ExportedAuthorization::Authorization(auth) = exported;
+
+    client
+        .invoke_in_dc(
+            dc_id,
+            &tl::functions::auth::ImportAuthorization {
+                id: auth.id,
+                bytes: auth.bytes,
+            },
+        )
+        .await
+        .map_err(|e| anyhow!(friendly(&e.to_string())))
+        .with_context(|| format!("importing authorization into DC {dc_id}"))?;
+
+    done.insert(dc_id);
     Ok(())
 }
 
@@ -603,11 +648,14 @@ impl Engine {
         let ceiling = settings.max_workers.clamp(1, MAX_SLOTS as u32);
         let mut set = tokio::task::JoinSet::new();
         let mut spawned = 0u32;
+        // Shared so the first worker to discover a migration spares the rest.
+        let dc = Arc::new(AtomicI32::new(0));
 
         let spawn_worker = |set: &mut tokio::task::JoinSet<Result<()>>, slot: u32| {
             let worker = Worker {
                 slot,
                 client: client.clone(),
+                dc: Arc::clone(&dc),
                 location: location.clone(),
                 part: part.clone(),
                 dest: dest.clone(),
@@ -801,6 +849,10 @@ enum Outcome {
 struct Worker {
     slot: u32,
     client: Client,
+    /// Which data center this file actually lives on. 0 = the account's home
+    /// DC; set once a `FILE_MIGRATE` reply tells us otherwise. Shared across
+    /// the job's workers so only the first one to hit it pays the redirect.
+    dc: Arc<AtomicI32>,
     location: tl::enums::InputFileLocation,
     part: PathBuf,
     dest: PathBuf,
@@ -885,7 +937,13 @@ impl Worker {
         let mut attempt = 0u32;
         loop {
             attempt += 1;
-            match self.client.invoke(&request).await {
+            let dc = self.dc.load(Ordering::Relaxed);
+            let sent = if dc > 0 {
+                self.client.invoke_in_dc(dc, &request).await
+            } else {
+                self.client.invoke(&request).await
+            };
+            match sent {
                 Ok(tl::enums::upload::File::File(f)) => {
                     self.live.flood_until.store(0, Ordering::Relaxed);
                     let expected = (self.size - offset).min(CHUNK) as usize;
@@ -902,6 +960,19 @@ impl Worker {
                     // unreachable; treat it as a hard error rather than
                     // pretending we handled it.
                     return Err(anyhow!("Telegram redirected this file to a CDN, which TeleWire does not support yet."));
+                }
+                // The file lives on another data center. Copy the
+                // authorization there once, remember the DC for the rest of
+                // this job, and retry the same chunk — this is the difference
+                // between "large files fail" and "large files work", since
+                // Telegram routinely stores them off the home DC.
+                Err(InvocationError::Rpc(ref rpc)) if rpc.is("FILE_MIGRATE") => {
+                    let Some(target) = rpc.value.map(|v| v as i32) else {
+                        return Err(anyhow!("Telegram asked for a data center it didn't name"));
+                    };
+                    ensure_dc_auth(&self.client, target).await?;
+                    self.dc.store(target, Ordering::Relaxed);
+                    continue;
                 }
                 Err(InvocationError::Rpc(ref rpc)) if rpc.is("FLOOD_WAIT") => {
                     // §11.8 — back off exactly this task for exactly as long as
