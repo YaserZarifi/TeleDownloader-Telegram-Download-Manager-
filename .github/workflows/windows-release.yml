@@ -1,0 +1,104 @@
+name: Windows release
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install build dependencies
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup override set stable-x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm.cmd ci
+
+      - name: Build versioned Windows installers
+        run: |
+          $config = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $base = [version]$config.version
+          $patch = $base.Build + [int]$env:GITHUB_RUN_NUMBER
+          if ($patch -gt 65535) { throw 'The patch version exceeds the MSI limit.' }
+          $version = "$($base.Major).$($base.Minor).$patch"
+          $overlay = Join-Path $env:RUNNER_TEMP 'telewire-release.json'
+          @{ version = $version } | ConvertTo-Json | Set-Content -LiteralPath $overlay
+
+          npm.cmd run bundle:windows -- --ci --config $overlay -- --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $bundles = 'src-tauri/target/x86_64-pc-windows-msvc/release/bundle'
+          $exe = Get-Item -LiteralPath "$bundles/nsis/TeleWire_${version}_x64-setup.exe"
+          $msi = Get-Item -LiteralPath "$bundles/msi/TeleWire_${version}_x64_en-US.msi"
+          "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
+          "EXE_INSTALLER=$($exe.FullName)" >> $env:GITHUB_ENV
+          "MSI_INSTALLER=$($msi.FullName)" >> $env:GITHUB_ENV
+
+      - name: Install and launch TeleWire from the EXE package
+        run: |
+          $installDir = Join-Path $env:RUNNER_TEMP 'TeleWire smoke test'
+          $installer = Start-Process -FilePath $env:EXE_INSTALLER `
+            -ArgumentList "/S /D=$installDir" -WindowStyle Hidden -Wait -PassThru
+          if ($installer.ExitCode -ne 0) {
+            throw "The EXE installer exited with code $($installer.ExitCode)."
+          }
+
+          $app = Start-Process -FilePath (Join-Path $installDir 'telewire.exe') `
+            -WorkingDirectory $installDir -PassThru
+          try {
+            for ($attempt = 0; $attempt -lt 30; $attempt++) {
+              $app.Refresh()
+              if ($app.HasExited) { throw "TeleWire exited with code $($app.ExitCode)." }
+              if ($app.MainWindowTitle -eq 'TeleWire') { break }
+              Start-Sleep -Seconds 1
+            }
+            if ($app.MainWindowTitle -ne 'TeleWire') { throw 'The TeleWire window did not open.' }
+          } finally {
+            if (!$app.HasExited) { Stop-Process -Id $app.Id -ErrorAction SilentlyContinue }
+          }
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v$env:RELEASE_VERSION"
+          $assets = @($env:EXE_INSTALLER, $env:MSI_INSTALLER)
+          $details = gh release view $tag --json isDraft,targetCommitish,assets 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag @assets --target $env:GITHUB_SHA --generate-notes `
+              --title "TeleWire $env:RELEASE_VERSION"
+            exit $LASTEXITCODE
+          }
+
+          $release = $details | ConvertFrom-Json
+          if ($release.targetCommitish -ne $env:GITHUB_SHA) {
+            throw "$tag already belongs to a different commit."
+          }
+          if ($release.isDraft) {
+            gh release upload $tag @assets --clobber
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            gh release edit $tag --draft=false
+            exit $LASTEXITCODE
+          }
+
+          foreach ($asset in $assets) {
+            if ((Split-Path -Leaf $asset) -notin $release.assets.name) {
+              throw "$tag is already published without all expected installers."
+            }
+          }
+          Write-Host "$tag already contains both installers."
