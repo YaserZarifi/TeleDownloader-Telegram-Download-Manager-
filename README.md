@@ -43,9 +43,11 @@ Free, open source, MIT, and there is nothing to pay for — ever.
 - A platform webview: **WebView2** on Windows (preinstalled on Windows 11),
   **WebKitGTK** on Linux, **WKWebView** on macOS
 
-On Windows the MSVC toolchain is the usual choice. The project also builds
-fine on the `x86_64-pc-windows-gnu` toolchain with MinGW-w64, which is handy
-when you can't install Visual Studio Build Tools.
+For Windows x64 installers, install Visual Studio Build Tools with the
+**Desktop development with C++** workload and run
+`rustup target add x86_64-pc-windows-msvc`. The MSVC build links the WebView2
+loader into `telewire.exe`. The installers still set up the WebView2 Runtime
+when Windows needs it. MinGW-w64 can still be used for local development.
 
 ### Build
 
@@ -54,8 +56,23 @@ git clone https://github.com/YaserZarifi/TeleDownloader-Telegram-Download-Manage
 cd TeleDownloader-Telegram-Download-Manager-
 npm install
 npm run app          # run it
-npm run bundle       # produce installers in src-tauri/target/release/bundle/
+npm run bundle:windows  # build the Windows x64 NSIS and MSI installers
 ```
+
+Use `npm run bundle:windows` for Windows x64 releases. The installers are
+written to `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/`. On other
+platforms, use `npm run bundle`.
+
+Every push to `master`, including merged pull requests, builds the Windows x64
+installers on GitHub Actions. The workflow installs the EXE package and waits
+for the TeleWire window before publishing the EXE and MSI on GitHub Releases.
+Release builds add the workflow run number to the patch version in
+`src-tauri/tauri.conf.json` so successive installers have distinct versions.
+
+If the v1.0 EXE installer leaves TeleWire unable to open with a missing
+`WebView2Loader.dll` message, uninstall that copy and use the
+`TeleWire_1.0.0_x64_en-US.msi` asset from the same release. The MSI includes
+the loader alongside `telewire.exe`.
 
 Other scripts:
 
@@ -91,7 +108,7 @@ Everyone who runs your build then sees only a phone-number prompt:
 ```bash
 cp src-tauri/telewire.credentials.example src-tauri/telewire.credentials
 # fill in the two values, then
-npm run bundle
+npm run bundle:windows  # for Windows x64 releases
 ```
 
 That file is gitignored. You can also pass `TELEWIRE_API_ID` and
