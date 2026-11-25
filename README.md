@@ -1,5 +1,10 @@
 # TeleWire
 
+[![Latest GitHub release][release-badge]][latest-release]
+[![Total release asset downloads][downloads-badge]][releases]
+[![GitHub stars][stars-badge]][stargazers]
+[![MIT license][license-badge]](LICENSE)
+
 A desktop download manager for Telegram. It signs into your own account, lets
 you browse any chat's media history, and pulls files straight to disk over
 several parallel connections — with pause, resume, queueing, and downloads
@@ -10,6 +15,16 @@ same way the official desktop app is. The only two parties ever exchanging
 file bytes are Telegram's data centers and your disk.
 
 Free, open source, MIT, and there is nothing to pay for — ever.
+
+**[Download for Windows x64][latest-release]**
+
+[release-badge]: https://img.shields.io/github/v/release/YaserZarifi/TeleDownloader-Telegram-Download-Manager-?style=flat-square&label=release
+[downloads-badge]: https://img.shields.io/github/downloads/YaserZarifi/TeleDownloader-Telegram-Download-Manager-/total?style=flat-square&label=release%20downloads
+[stars-badge]: https://img.shields.io/github/stars/YaserZarifi/TeleDownloader-Telegram-Download-Manager-?style=flat-square&logo=github&label=stars
+[license-badge]: https://img.shields.io/badge/license-MIT-blue?style=flat-square
+[latest-release]: https://github.com/YaserZarifi/TeleDownloader-Telegram-Download-Manager-/releases/latest
+[releases]: https://github.com/YaserZarifi/TeleDownloader-Telegram-Download-Manager-/releases
+[stargazers]: https://github.com/YaserZarifi/TeleDownloader-Telegram-Download-Manager-/stargazers
 
 ---
 
