@@ -49,8 +49,8 @@ let jobsRefresh = 0;
 let channels: ChannelInfo[] = [];
 /** Lower-cased rail filter, applied to title and @username. */
 let railQuery = "";
-/** Active folder tab. "all" shows every chat, grouped by kind. */
-let railFolder: ChatKind | "all" = "all";
+type RailFolder = ChatKind | "all" | "archived";
+let railFolder: RailFolder = "all";
 let railFolderStrip: HTMLElement | null = null;
 let railFolderFades: (() => void) | null = null;
 /** The welcome banner is a launch event, not a render event. */
@@ -326,7 +326,7 @@ async function mountShell(auth: Extract<AuthState, { stage: "ready" }>): Promise
   });
 
   await loadChannels(railList);
-  addBtn.addEventListener("click", () => promptChannel(railList));
+  addBtn.addEventListener("click", () => promptChannel(railList, railSearch));
 
   // Once, per launch — a banner that reappears on every re-render is noise.
   // It exists to confirm *which* account is connected, which is worth stating
@@ -432,9 +432,10 @@ async function loadChannels(host: HTMLElement): Promise<void> {
   renderChannels(host);
 }
 
-/** Folder order. Saved leads because it is the account's own file store. */
-const FOLDERS: Array<{ id: ChatKind | "all"; label: string }> = [
+/** Keep Archived near All so both stay visible in the sidebar. */
+const FOLDERS: Array<{ id: RailFolder; label: string }> = [
   { id: "all", label: "All" },
+  { id: "archived", label: "Archived" },
   { id: "saved", label: "Saved" },
   { id: "channel", label: "Channels" },
   { id: "group", label: "Groups" },
@@ -442,24 +443,42 @@ const FOLDERS: Array<{ id: ChatKind | "all"; label: string }> = [
   { id: "person", label: "People" },
 ];
 
+function chatInFolder(chat: ChannelInfo, folder: RailFolder): boolean {
+  if (folder === "archived") return chat.archived;
+  return !chat.archived && (folder === "all" || chat.kind === folder);
+}
+
 function renderFolders(host: HTMLElement): void {
   host.replaceChildren();
+  host.dataset.hasArchive = String(channels.some((c) => c.archived));
+  if (railFolder !== "all" && !channels.some((c) => chatInFolder(c, railFolder))) {
+    railFolder = "all";
+  }
+
   for (const f of FOLDERS) {
-    const n = f.id === "all" ? channels.length : channels.filter((c) => c.kind === f.id).length;
+    const n = channels.filter((c) => chatInFolder(c, f.id)).length;
     // An empty folder is noise — Telegram hides them too. "All" always shows.
     if (n === 0 && f.id !== "all") continue;
 
     const tab = el("button.folder", {
       type: "button",
       role: "tab",
+      "data-folder": f.id,
+      "aria-label": f.label,
       "aria-selected": String(railFolder === f.id),
+      title: f.label,
     }, [
-      el("span", {}, f.label),
+      f.id === "all" || f.id === "archived"
+        ? el("span.folder-icon", { html: icon(f.id === "all" ? "inbox" : "archive", 16) })
+        : null,
+      el("span.folder-label", {}, f.label),
       el("span.count-pill", {}, String(n)),
     ]);
     tab.addEventListener("click", () => {
       railFolder = f.id;
-      renderFolders(host);
+      for (const folder of host.querySelectorAll(".folder")) {
+        folder.setAttribute("aria-selected", String(folder === tab));
+      }
       renderChannels(must(".rail-scroll"));
       // Bring a partly-clipped tab fully into view once it becomes the
       // selection, so the active folder is never the one hidden by a fade.
@@ -481,7 +500,7 @@ function renderChannels(host: HTMLElement): void {
   }
 
   const matches = channels
-    .filter((c) => railFolder === "all" || c.kind === railFolder)
+    .filter((c) => chatInFolder(c, railFolder))
     .filter(
       (c) =>
         !railQuery ||
@@ -500,16 +519,14 @@ function renderChannels(host: HTMLElement): void {
     return;
   }
 
-  // Inside a specific folder the rows are already homogeneous, so the group
-  // headings would just repeat the selected tab. They only earn their place
-  // in "All".
+  // All is grouped by chat kind. Archived keeps Telegram's dialog order.
   if (railFolder !== "all") {
     renderChannelRows(host, matches);
     return;
   }
 
   for (const f of FOLDERS) {
-    if (f.id === "all") continue;
+    if (f.id === "all" || f.id === "archived") continue;
     const list = matches.filter((c) => c.kind === f.id);
     if (!list.length) continue;
     host.append(
@@ -690,7 +707,7 @@ function renderChannelRows(host: HTMLElement, list: ChannelInfo[]): void {
 }
 
 /** Resolve a channel by @username or t.me link and prepend it to the rail. */
-function promptChannel(host: HTMLElement): void {
+function promptChannel(host: HTMLElement, railSearch: HTMLInputElement): void {
   const input = el("input.input", {
     id: "chan-query",
     placeholder: "@channelname or https://t.me/…",
@@ -719,14 +736,16 @@ function promptChannel(host: HTMLElement): void {
     go.disabled = true;
     status.textContent = "Resolving…";
     try {
-      const ch = await ipc.resolveChannel(q);
+      const resolved = await ipc.resolveChannel(q);
+      const known = channels.find((c) => c.id === resolved.id);
+      const ch = { ...resolved, archived: known?.archived ?? resolved.archived };
       close();
       // Move an already-listed channel to the top rather than duplicating it,
       // and clear any filter that would hide the thing just added.
       channels = [ch, ...channels.filter((c) => c.id !== ch.id)];
-      // Clear any filter or folder that would hide the thing just added.
+      railSearch.value = "";
       railQuery = "";
-      railFolder = "all";
+      railFolder = ch.archived ? "archived" : "all";
       selectedChannelId = ch.id;
       if (railFolderStrip) renderFolders(railFolderStrip);
       renderChannels(host);

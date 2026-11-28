@@ -17,6 +17,8 @@ use crate::model::{ChannelInfo, ChatKind, MediaFilter, MediaItem, MediaKind, Med
 /// `next_offset_id`, so the UI simply pages again.
 const SCAN_CAP: usize = 600;
 
+const ARCHIVE_FOLDER_ID: i32 = 1;
+
 /// True for the signed-in account's own chat — Telegram's "Saved Messages".
 fn is_saved_messages(peer: &Peer) -> bool {
     matches!(peer, Peer::User(u) if u.is_self())
@@ -66,12 +68,11 @@ fn peer_info(peer: &Peer, id: i64) -> ChannelInfo {
         photo: None,
         broadcast: matches!(peer, Peer::Channel(_)),
         kind,
+        archived: false,
     }
 }
 
-/// Everything the signed-in account already has in its chat list, narrowed to
-/// channels and groups — one-to-one conversations have no media library worth
-/// browsing here.
+/// Chats from the signed-in account's dialog list, including the archive.
 pub async fn list_dialogs(tg: &Telegram, client: &Client) -> Result<Vec<ChannelInfo>> {
     let mut out = Vec::new();
     let mut iter = client.iter_dialogs();
@@ -83,13 +84,16 @@ pub async fn list_dialogs(tg: &Telegram, client: &Client) -> Result<Vec<ChannelI
         .await
         .map_err(|e| anyhow!(friendly(&e.to_string())))?
     {
-        // Every chat is listed — channels, groups, bots and people. Files
-        // arrive through all of them, and filtering any out just means the one
-        // the user wanted is missing. The rail groups them by kind instead.
+        // Telegram also returns a folder summary. Its peer represents the
+        // folder's latest chat, so listing it would duplicate a real dialog.
+        let tl::enums::Dialog::Dialog(raw) = &dialog.raw else {
+            continue;
+        };
         let peer = dialog.peer();
         let peer_ref = dialog.peer_ref();
         let id = peer_key(peer);
-        let info = peer_info(peer, id);
+        let mut info = peer_info(peer, id);
+        info.archived = raw.folder_id == Some(ARCHIVE_FOLDER_ID);
         tg.remember_peer(id, peer_ref, &info.title).await;
         out.push(info);
 

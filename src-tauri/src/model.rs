@@ -71,6 +71,7 @@ pub struct ChannelInfo {
     pub photo: Option<String>,
     pub broadcast: bool,
     pub kind: ChatKind,
+    pub archived: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

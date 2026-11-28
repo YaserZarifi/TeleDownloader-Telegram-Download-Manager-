@@ -240,6 +240,7 @@ const CHANNELS: ChannelInfo[] = [
     photo: null,
     broadcast: false,
     kind: "saved",
+    archived: false,
   },
   {
     id: 770010002,
@@ -249,6 +250,7 @@ const CHANNELS: ChannelInfo[] = [
     photo: null,
     broadcast: false,
     kind: "bot",
+    archived: false,
   },
   {
     id: 770010003,
@@ -258,6 +260,7 @@ const CHANNELS: ChannelInfo[] = [
     photo: avatar("PR", "#d4633b", "#8c2f6f"),
     broadcast: false,
     kind: "person",
+    archived: false,
   },
   {
     id: -1001204775319,
@@ -267,6 +270,7 @@ const CHANNELS: ChannelInfo[] = [
     photo: avatar("DV", "#3b6fd4", "#7d4fd6"),
     broadcast: true,
     kind: "channel",
+    archived: true,
   },
   {
     id: -1001338910477,
@@ -276,6 +280,7 @@ const CHANNELS: ChannelInfo[] = [
     photo: null,
     broadcast: true,
     kind: "channel",
+    archived: false,
   },
   {
     id: -1001472066218,
@@ -285,6 +290,7 @@ const CHANNELS: ChannelInfo[] = [
     photo: avatar("FR", "#1f9d7a", "#0f6f8c"),
     broadcast: true,
     kind: "channel",
+    archived: false,
   },
   {
     id: -1001559430062,
@@ -294,6 +300,7 @@ const CHANNELS: ChannelInfo[] = [
     photo: null,
     broadcast: false,
     kind: "group",
+    archived: false,
   },
   {
     id: -1001610338925,
@@ -303,6 +310,7 @@ const CHANNELS: ChannelInfo[] = [
     photo: null,
     broadcast: false,
     kind: "group",
+    archived: false,
   },
   {
     id: -1001744029183,
@@ -312,6 +320,7 @@ const CHANNELS: ChannelInfo[] = [
     photo: null,
     broadcast: true,
     kind: "channel",
+    archived: false,
   },
   {
     id: -1001827365440,
@@ -321,6 +330,7 @@ const CHANNELS: ChannelInfo[] = [
     photo: null,
     broadcast: true,
     kind: "channel",
+    archived: false,
   },
   {
     id: -1001998120744,
@@ -330,6 +340,7 @@ const CHANNELS: ChannelInfo[] = [
     photo: null,
     broadcast: false,
     kind: "group",
+    archived: true,
   },
 ];
 
@@ -362,6 +373,7 @@ function resolveChannel(query: string): ChannelInfo {
     photo: null,
     broadcast: rnd() < 0.7,
     kind: rnd() < 0.7 ? "channel" : "group",
+    archived: false,
   };
   resolved.set(info.id, info);
   return info;

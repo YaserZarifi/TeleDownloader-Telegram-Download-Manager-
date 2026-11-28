@@ -400,7 +400,8 @@ h3 {
   flex-direction: column;
   gap: var(--s2);
 }
-.rail-head .search {
+.rail-head .search,
+.rail-head .search:focus-within {
   max-width: none;
   width: 100%;
   /* The toolbar search grows via flex-basis, but rail-head is a COLUMN, where
@@ -482,6 +483,9 @@ h3 {
 .folder:hover {
   color: var(--text);
 }
+.folder-icon {
+  display: none;
+}
 .folder[aria-selected="true"] {
   color: var(--amber);
   border-bottom-color: var(--amber);
@@ -526,8 +530,24 @@ h3 {
 @media (max-width: 880px) {
   .rail-head .search,
   .rail-group,
-  .folders {
+  .folders:not([data-has-archive="true"]),
+  .folders .folder:not([data-folder="all"]):not([data-folder="archived"]),
+  .folders .folder-label,
+  .folders .count-pill {
     display: none;
+  }
+  .folders {
+    flex-direction: column;
+    margin: 0;
+    overflow: visible;
+    -webkit-mask-image: none;
+    mask-image: none;
+  }
+  .folder {
+    justify-content: center;
+  }
+  .folder-icon {
+    display: inline-flex;
   }
 }
 

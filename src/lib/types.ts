@@ -49,6 +49,8 @@ export interface ChannelInfo {
   /** True for broadcast channels, false for groups and Saved Messages. */
   broadcast: boolean;
   kind: ChatKind;
+  /** True when Telegram lists this chat in its archive. */
+  archived: boolean;
 }
 
 export type MediaKind = "video" | "audio" | "photo" | "document";
