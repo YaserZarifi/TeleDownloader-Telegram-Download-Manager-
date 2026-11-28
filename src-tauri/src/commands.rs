@@ -196,7 +196,7 @@ pub async fn retry_download(state: State<'_, AppState>, job_id: String) -> Resul
 
 #[tauri::command]
 pub async fn list_jobs(state: State<'_, AppState>) -> Result<Vec<Job>, String> {
-    Ok(state.engine.list().await)
+    state.engine.list().await.map_err(err)
 }
 
 #[tauri::command]

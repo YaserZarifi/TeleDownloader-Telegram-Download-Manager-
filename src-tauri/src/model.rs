@@ -71,6 +71,7 @@ pub struct ChannelInfo {
     pub photo: Option<String>,
     pub broadcast: bool,
     pub kind: ChatKind,
+    pub archived: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -157,7 +158,7 @@ pub struct MediaPage {
 
 /* ------------------------------------------------------------- downloads */
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
     Queued,
@@ -174,7 +175,7 @@ impl JobState {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Job {
     pub id: String,
     pub channel_id: i64,

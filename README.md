@@ -153,9 +153,9 @@ stays free of credentials by design.
 4. Several workers pull from one shared queue of chunk indices. This is the
    work-stealing part: a slow connection simply takes fewer chunks instead of
    holding up a statically assigned range.
-5. Worker count starts low and climbs while each added connection actually
-   improves measured throughput, then backs off when it stops helping or
-   Telegram starts issuing flood-waits.
+5. Adaptive mode starts with two workers when the file has enough remaining
+   chunks and the connection limit allows it. It measures the effect of each
+   extra worker, removes it if it does not help, and retries after a cooldown.
 6. A sidecar manifest records which chunks are confirmed *flushed to disk*, so
    relaunching after a crash resumes precisely rather than restarting or
    silently corrupting.

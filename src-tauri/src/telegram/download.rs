@@ -49,9 +49,13 @@ use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
+mod concurrency;
+mod history;
+
 use super::{friendly, Telegram};
 use crate::model::{Job, JobState, ProgressBatch, ProgressEntry, Settings, EV_JOB, EV_PROGRESS};
 use crate::store;
+use concurrency::WorkerTuner;
 
 /// 512 KiB — grammers' own `MAX_CHUNK_SIZE`, and the largest value that keeps
 /// every request inside a single 1 MiB window.
@@ -182,7 +186,7 @@ struct Live {
     /// How many worker slots should currently be running. The adaptive
     /// controller moves this; workers whose slot index reaches it retire.
     target: AtomicU32,
-    active: AtomicU32,
+    active_slots: AtomicU32,
     /// Cumulative bytes per slot; the ticker differentiates these to get each
     /// connection's real throughput.
     per_slot: Vec<AtomicU64>,
@@ -195,7 +199,7 @@ impl Live {
             done: AtomicU64::new(done),
             total,
             target: AtomicU32::new(start_workers),
-            active: AtomicU32::new(0),
+            active_slots: AtomicU32::new(0),
             per_slot: (0..MAX_SLOTS).map(|_| AtomicU64::new(0)).collect(),
             flood_until: AtomicI64::new(0),
         }
@@ -204,6 +208,7 @@ impl Live {
 
 struct Record {
     job: Job,
+    account_id: i64,
     control: Arc<Control>,
     live: Option<Arc<Live>>,
     /// Kept so a paused job can be resumed without re-resolving the message.
@@ -216,6 +221,9 @@ pub struct Engine {
     app: AppHandle,
     tg: Arc<Telegram>,
     jobs: Mutex<HashMap<String, Record>>,
+    /// Serializes saving, listing and clearing finished transfers without
+    /// holding the live job lock during filesystem operations.
+    history_lock: Mutex<()>,
     /// Insertion order, so the queue renders and promotes deterministically.
     order: Mutex<Vec<String>>,
     /// Nudges the scheduler to look for promotable work.
@@ -236,6 +244,7 @@ impl Engine {
             app,
             tg,
             jobs: Mutex::new(HashMap::new()),
+            history_lock: Mutex::new(()),
             order: Mutex::new(Vec::new()),
             wake,
         });
@@ -266,13 +275,28 @@ impl Engine {
 
     /* ---------------------------------------------------------- listing */
 
-    pub async fn list(&self) -> Vec<Job> {
+    pub async fn list(&self) -> Result<Vec<Job>> {
+        let account_id = self.tg.account_id().await?;
+        let _history = self.history_lock.lock().await;
+        let mut completed = match history::account_dir(account_id) {
+            Ok(dir) => history::load(&dir).await,
+            Err(error) => Err(error),
+        }
+        .unwrap_or_else(|error| {
+            log::warn!("Could not load completed downloads: {error:#}");
+            Vec::new()
+        });
+        let saved_ids: HashSet<_> = completed.iter().map(|job| job.id.as_str()).collect();
         let jobs = self.jobs.lock().await;
         let order = self.order.lock().await;
-        order
+        let current: Vec<_> = order
             .iter()
-            .filter_map(|id| jobs.get(id).map(|r| r.job.clone()))
-            .collect()
+            .filter_map(|id| jobs.get(id))
+            .filter(|rec| rec.account_id == account_id && !saved_ids.contains(rec.job.id.as_str()))
+            .map(|rec| rec.job.clone())
+            .collect();
+        completed.extend(current);
+        Ok(completed)
     }
 
     async fn emit_job(&self, job: &Job) {
@@ -319,7 +343,8 @@ impl Engine {
                     *s = *s * 0.65 + inst * 0.35;
                     let bps = *s as u64;
 
-                    let active = live.active.load(Ordering::Relaxed);
+                    let active_slots = live.active_slots.load(Ordering::Relaxed);
+                    let active = active_slots.count_ones();
 
                     // Each bar is a connection's CUMULATIVE haul this transfer,
                     // relative to the busiest one — so the strip only ever
@@ -329,8 +354,9 @@ impl Engine {
                     let slots: Vec<u64> = live
                         .per_slot
                         .iter()
-                        .take(active.max(1) as usize)
-                        .map(|a| a.load(Ordering::Relaxed))
+                        .enumerate()
+                        .filter(|(slot, _)| active_slots & (1 << *slot) != 0)
+                        .map(|(_, bytes)| bytes.load(Ordering::Relaxed))
                         .collect();
                     let peak = slots.iter().copied().max().unwrap_or(0).max(1);
                     let worker_fill: Vec<f32> = slots
@@ -350,7 +376,8 @@ impl Engine {
                     rec.job.workers = active;
                     rec.job.worker_fill = worker_fill.clone();
                     let flood = live.flood_until.load(Ordering::Relaxed);
-                    rec.job.flood_wait_until = (flood > 0).then_some(flood);
+                    rec.job.flood_wait_until =
+                        (flood > chrono::Utc::now().timestamp()).then_some(flood);
 
                     total_bps = total_bps.saturating_add(bps);
                     entries.push(ProgressEntry {
@@ -393,6 +420,7 @@ impl Engine {
         channel_title: String,
         message_ids: Vec<i32>,
     ) -> Result<Vec<Job>> {
+        let account_id = self.tg.account_id().await?;
         let client = self.tg.client().await?;
         let peer = self
             .tg
@@ -447,6 +475,7 @@ impl Engine {
                     job.id.clone(),
                     Record {
                         job: job.clone(),
+                        account_id,
                         control: Arc::new(Control {
                             paused: AtomicBool::new(false),
                             cancelled: AtomicBool::new(false),
@@ -514,7 +543,12 @@ impl Engine {
     }
 
     async fn finish(self: &Arc<Self>, id: &str, outcome: Result<Outcome>) {
-        let job = {
+        let history_guard = if matches!(&outcome, Ok(Outcome::Complete)) {
+            Some(self.history_lock.lock().await)
+        } else {
+            None
+        };
+        let (job, account_id) = {
             let mut jobs = self.jobs.lock().await;
             let Some(rec) = jobs.get_mut(id) else { return };
             rec.live = None;
@@ -525,6 +559,8 @@ impl Engine {
                 Ok(Outcome::Complete) => {
                     rec.job.state = JobState::Done;
                     rec.job.done = rec.job.size;
+                    rec.job.eta_s = None;
+                    rec.job.flood_wait_until = None;
                 }
                 Ok(Outcome::Paused) => rec.job.state = JobState::Paused,
                 Ok(Outcome::Cancelled) => rec.job.state = JobState::Cancelled,
@@ -538,9 +574,21 @@ impl Engine {
                     }
                 }
             }
-            rec.job.clone()
+            (rec.job.clone(), rec.account_id)
         };
-        self.emit_job(&job).await;
+        if history_guard.is_some() {
+            let saved = match history::account_dir(account_id) {
+                Ok(dir) => history::record(&dir, &job).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = saved {
+                log::warn!("Could not save completed download: {error:#}");
+            }
+        }
+        if self.tg.account_id().await.ok() == Some(account_id) {
+            self.emit_job(&job).await;
+        }
+        drop(history_guard);
         self.nudge();
     }
 
@@ -616,9 +664,12 @@ impl Engine {
     }
 
     pub async fn clear_finished(&self) -> Result<()> {
+        let account_id = self.tg.account_id().await?;
+        let _history = self.history_lock.lock().await;
+        history::clear(&history::account_dir(account_id)?).await?;
         let mut jobs = self.jobs.lock().await;
         let mut order = self.order.lock().await;
-        jobs.retain(|_, r| !r.job.state.is_terminal());
+        jobs.retain(|_, r| r.account_id != account_id || !r.job.state.is_terminal());
         order.retain(|id| jobs.contains_key(id));
         Ok(())
     }
@@ -670,17 +721,17 @@ impl Engine {
         // Hand the lowest offsets out first: sequential-ish access is friendlier
         // to the filesystem and makes a partially-downloaded file useful sooner.
         pending.sort_unstable();
+        let ceiling = settings
+            .max_workers
+            .clamp(1, MAX_SLOTS as u32)
+            .min(pending.len() as u32);
+        let mut tuner = WorkerTuner::new(ceiling, settings.adaptive);
         let queue = Arc::new(Mutex::new(std::collections::VecDeque::from(pending)));
 
-        let start_workers = if settings.adaptive {
-            2
-        } else {
-            settings.max_workers.min(MAX_SLOTS as u32)
-        };
         let live = Arc::new(Live::new(
             size,
             already.len() as u64 * CHUNK,
-            start_workers.max(1),
+            tuner.target(),
         ));
         {
             let mut jobs = self.jobs.lock().await;
@@ -689,15 +740,14 @@ impl Engine {
             }
         }
 
-        let ceiling = settings.max_workers.clamp(1, MAX_SLOTS as u32);
         let mut set = tokio::task::JoinSet::new();
-        let mut spawned = 0u32;
+        let mut running = [false; MAX_SLOTS];
         // Shared so the first worker to discover a migration spares the rest.
         let dc = Arc::new(AtomicI32::new(0));
 
-        let spawn_worker = |set: &mut tokio::task::JoinSet<Result<()>>, slot: u32| {
+        let spawn_worker = |set: &mut tokio::task::JoinSet<(usize, Result<()>)>, slot: usize| {
             let worker = Worker {
-                slot,
+                slot: slot as u32,
                 client: client.clone(),
                 dc: Arc::clone(&dc),
                 location: location.clone(),
@@ -709,62 +759,7 @@ impl Engine {
                 live: Arc::clone(&live),
                 control: Arc::clone(&control),
             };
-            set.spawn(async move { worker.run().await });
-        };
-
-        for slot in 0..start_workers.min(ceiling) {
-            spawn_worker(&mut set, slot);
-            spawned += 1;
-        }
-
-        // Adaptive controller (§11.4). Probes upward while the marginal worker
-        // is actually earning its keep, and backs off when it isn't. This is the
-        // difference between "several connections" and "faster".
-        let controller = {
-            let live = Arc::clone(&live);
-            let control = Arc::clone(&control);
-            tokio::spawn(async move {
-                if !settings.adaptive {
-                    return;
-                }
-                let mut last_bytes = live.done.load(Ordering::Relaxed);
-                let mut last_rate = 0f64;
-                let mut probing_up = true;
-                loop {
-                    tokio::time::sleep(PROBE_INTERVAL).await;
-                    if control.cancelled.load(Ordering::Relaxed)
-                        || control.paused.load(Ordering::Relaxed)
-                    {
-                        return;
-                    }
-                    let now = live.done.load(Ordering::Relaxed);
-                    let rate = (now.saturating_sub(last_bytes)) as f64
-                        / PROBE_INTERVAL.as_secs_f64();
-                    last_bytes = now;
-
-                    let target = live.target.load(Ordering::Relaxed);
-                    if last_rate > 0.0 {
-                        let gain = (rate - last_rate) / last_rate;
-                        if probing_up && gain < 0.08 {
-                            // The extra connection didn't pay for itself. Give
-                            // it back and stop climbing.
-                            if target > 1 {
-                                live.target.store(target - 1, Ordering::Relaxed);
-                            }
-                            probing_up = false;
-                        } else if gain < -0.15 && target > 1 {
-                            // Throughput collapsed (congestion, or Telegram
-                            // throttling): shed a connection.
-                            live.target.store(target - 1, Ordering::Relaxed);
-                        } else if probing_up && target < ceiling {
-                            live.target.store(target + 1, Ordering::Relaxed);
-                        }
-                    } else if target < ceiling {
-                        live.target.store(target + 1, Ordering::Relaxed);
-                    }
-                    last_rate = rate;
-                }
-            })
+            set.spawn(async move { (slot, worker.run().await) });
         };
 
         // Periodically flush the manifest so a crash costs at most a couple of
@@ -781,33 +776,70 @@ impl Engine {
             })
         };
 
-        // Top up worker slots as the controller raises the target.
+        let mut probe_ticks = tokio::time::interval_at(
+            tokio::time::Instant::now() + PROBE_INTERVAL,
+            PROBE_INTERVAL,
+        );
+        probe_ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_bytes = live.done.load(Ordering::Relaxed);
+        let mut last_sample = Instant::now();
         let mut failure: Option<anyhow::Error> = None;
         loop {
-            let target = live.target.load(Ordering::Relaxed).min(ceiling);
-            while spawned < target {
-                spawn_worker(&mut set, spawned);
-                spawned += 1;
+            let stopped = control.cancelled.load(Ordering::Relaxed)
+                || control.paused.load(Ordering::Relaxed);
+            let target = tuner.target() as usize;
+            if !stopped && running[..target].contains(&false) {
+                let mut pending = queue.lock().await.len();
+                for (slot, active) in running[..target].iter_mut().enumerate() {
+                    if pending == 0 {
+                        break;
+                    }
+                    if !*active {
+                        spawn_worker(&mut set, slot);
+                        *active = true;
+                        pending -= 1;
+                    }
+                }
+            }
+            if set.is_empty() {
+                break;
             }
 
-            match tokio::time::timeout(Duration::from_millis(250), set.join_next()).await {
-                Ok(Some(Ok(Ok(())))) => {}
-                Ok(Some(Ok(Err(e)))) => {
-                    failure.get_or_insert(e);
-                    control.cancelled.store(true, Ordering::SeqCst);
+            tokio::select! {
+                result = set.join_next() => match result {
+                    Some(Ok((slot, result))) => {
+                        running[slot] = false;
+                        if let Err(e) = result {
+                            failure.get_or_insert(e);
+                            control.cancelled.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    Some(Err(e)) => {
+                        failure.get_or_insert(anyhow!("worker panicked: {e}"));
+                        control.cancelled.store(true, Ordering::SeqCst);
+                    }
+                    None => break,
+                },
+                _ = probe_ticks.tick(), if settings.adaptive && !stopped => {
+                    let now = Instant::now();
+                    let bytes = live.done.load(Ordering::Relaxed);
+                    let rate = bytes.saturating_sub(last_bytes) as f64
+                        / now.duration_since(last_sample).as_secs_f64();
+                    last_bytes = bytes;
+                    last_sample = now;
+
+                    // The tail and an explicit Telegram wait are not useful
+                    // samples for deciding whether another worker helps.
+                    if live.flood_until.load(Ordering::Relaxed) <= chrono::Utc::now().timestamp()
+                        && queue.lock().await.len() > target
+                        && running[..target].iter().all(|active| *active)
+                    {
+                        live.target.store(tuner.sample(rate), Ordering::Relaxed);
+                    }
                 }
-                Ok(Some(Err(e))) => {
-                    failure.get_or_insert(anyhow!("worker panicked: {e}"));
-                    control.cancelled.store(true, Ordering::SeqCst);
-                }
-                // All workers have retired.
-                Ok(None) => break,
-                // Timeout: loop round to re-check the worker target.
-                Err(_) => {}
             }
         }
 
-        controller.abort();
         flusher.abort();
 
         let final_done = done_set.lock().await.clone();
@@ -917,9 +949,10 @@ impl Worker {
             .await
             .with_context(|| format!("could not open {}", self.part.display()))?;
 
-        self.live.active.fetch_add(1, Ordering::Relaxed);
+        let mask = 1 << self.slot;
+        self.live.active_slots.fetch_or(mask, Ordering::Relaxed);
         let result = self.pump(&mut file).await;
-        self.live.active.fetch_sub(1, Ordering::Relaxed);
+        self.live.active_slots.fetch_and(!mask, Ordering::Relaxed);
         let _ = file.flush().await;
         result
     }
@@ -989,7 +1022,6 @@ impl Worker {
             };
             match sent {
                 Ok(tl::enums::upload::File::File(f)) => {
-                    self.live.flood_until.store(0, Ordering::Relaxed);
                     let expected = (self.size - offset).min(CHUNK) as usize;
                     if f.bytes.len() < expected {
                         return Err(anyhow!(
@@ -1023,7 +1055,7 @@ impl Worker {
                     // Telegram asked, then carry on. The rest of the job keeps
                     // running.
                     let secs = rpc.value.unwrap_or(5).min(600) as u64;
-                    self.live.flood_until.store(
+                    self.live.flood_until.fetch_max(
                         chrono::Utc::now().timestamp() + secs as i64,
                         Ordering::Relaxed,
                     );
