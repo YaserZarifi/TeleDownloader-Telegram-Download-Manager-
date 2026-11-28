@@ -50,6 +50,7 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 mod concurrency;
+mod history;
 
 use super::{friendly, Telegram};
 use crate::model::{Job, JobState, ProgressBatch, ProgressEntry, Settings, EV_JOB, EV_PROGRESS};
@@ -207,6 +208,7 @@ impl Live {
 
 struct Record {
     job: Job,
+    account_id: i64,
     control: Arc<Control>,
     live: Option<Arc<Live>>,
     /// Kept so a paused job can be resumed without re-resolving the message.
@@ -219,6 +221,9 @@ pub struct Engine {
     app: AppHandle,
     tg: Arc<Telegram>,
     jobs: Mutex<HashMap<String, Record>>,
+    /// Serializes saving, listing and clearing finished transfers without
+    /// holding the live job lock during filesystem operations.
+    history_lock: Mutex<()>,
     /// Insertion order, so the queue renders and promotes deterministically.
     order: Mutex<Vec<String>>,
     /// Nudges the scheduler to look for promotable work.
@@ -239,6 +244,7 @@ impl Engine {
             app,
             tg,
             jobs: Mutex::new(HashMap::new()),
+            history_lock: Mutex::new(()),
             order: Mutex::new(Vec::new()),
             wake,
         });
@@ -269,13 +275,28 @@ impl Engine {
 
     /* ---------------------------------------------------------- listing */
 
-    pub async fn list(&self) -> Vec<Job> {
+    pub async fn list(&self) -> Result<Vec<Job>> {
+        let account_id = self.tg.account_id().await?;
+        let _history = self.history_lock.lock().await;
+        let mut completed = match history::account_dir(account_id) {
+            Ok(dir) => history::load(&dir).await,
+            Err(error) => Err(error),
+        }
+        .unwrap_or_else(|error| {
+            log::warn!("Could not load completed downloads: {error:#}");
+            Vec::new()
+        });
+        let saved_ids: HashSet<_> = completed.iter().map(|job| job.id.as_str()).collect();
         let jobs = self.jobs.lock().await;
         let order = self.order.lock().await;
-        order
+        let current: Vec<_> = order
             .iter()
-            .filter_map(|id| jobs.get(id).map(|r| r.job.clone()))
-            .collect()
+            .filter_map(|id| jobs.get(id))
+            .filter(|rec| rec.account_id == account_id && !saved_ids.contains(rec.job.id.as_str()))
+            .map(|rec| rec.job.clone())
+            .collect();
+        completed.extend(current);
+        Ok(completed)
     }
 
     async fn emit_job(&self, job: &Job) {
@@ -399,6 +420,7 @@ impl Engine {
         channel_title: String,
         message_ids: Vec<i32>,
     ) -> Result<Vec<Job>> {
+        let account_id = self.tg.account_id().await?;
         let client = self.tg.client().await?;
         let peer = self
             .tg
@@ -453,6 +475,7 @@ impl Engine {
                     job.id.clone(),
                     Record {
                         job: job.clone(),
+                        account_id,
                         control: Arc::new(Control {
                             paused: AtomicBool::new(false),
                             cancelled: AtomicBool::new(false),
@@ -520,7 +543,12 @@ impl Engine {
     }
 
     async fn finish(self: &Arc<Self>, id: &str, outcome: Result<Outcome>) {
-        let job = {
+        let history_guard = if matches!(&outcome, Ok(Outcome::Complete)) {
+            Some(self.history_lock.lock().await)
+        } else {
+            None
+        };
+        let (job, account_id) = {
             let mut jobs = self.jobs.lock().await;
             let Some(rec) = jobs.get_mut(id) else { return };
             rec.live = None;
@@ -531,6 +559,8 @@ impl Engine {
                 Ok(Outcome::Complete) => {
                     rec.job.state = JobState::Done;
                     rec.job.done = rec.job.size;
+                    rec.job.eta_s = None;
+                    rec.job.flood_wait_until = None;
                 }
                 Ok(Outcome::Paused) => rec.job.state = JobState::Paused,
                 Ok(Outcome::Cancelled) => rec.job.state = JobState::Cancelled,
@@ -544,9 +574,21 @@ impl Engine {
                     }
                 }
             }
-            rec.job.clone()
+            (rec.job.clone(), rec.account_id)
         };
-        self.emit_job(&job).await;
+        if history_guard.is_some() {
+            let saved = match history::account_dir(account_id) {
+                Ok(dir) => history::record(&dir, &job).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = saved {
+                log::warn!("Could not save completed download: {error:#}");
+            }
+        }
+        if self.tg.account_id().await.ok() == Some(account_id) {
+            self.emit_job(&job).await;
+        }
+        drop(history_guard);
         self.nudge();
     }
 
@@ -622,9 +664,12 @@ impl Engine {
     }
 
     pub async fn clear_finished(&self) -> Result<()> {
+        let account_id = self.tg.account_id().await?;
+        let _history = self.history_lock.lock().await;
+        history::clear(&history::account_dir(account_id)?).await?;
         let mut jobs = self.jobs.lock().await;
         let mut order = self.order.lock().await;
-        jobs.retain(|_, r| !r.job.state.is_terminal());
+        jobs.retain(|_, r| r.account_id != account_id || !r.job.state.is_terminal());
         order.retain(|id| jobs.contains_key(id));
         Ok(())
     }

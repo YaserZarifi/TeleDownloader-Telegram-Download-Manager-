@@ -43,6 +43,7 @@ const root = must("#root");
 
 /** Jobs, keyed by id. The views render from this; nothing else owns it. */
 const jobs = new Map<string, Job>();
+let jobsRefresh = 0;
 /** Rail contents, in display order. Kept here rather than read back out of the
  *  DOM so adding a channel doesn't have to re-parse rendered markup. */
 let channels: ChannelInfo[] = [];
@@ -111,6 +112,8 @@ function route(state: AuthState): void {
 function teardown(): void {
   for (const off of unlisten) off();
   unlisten = [];
+  jobsRefresh++;
+  jobs.clear();
   wire?.destroy();
   browser?.destroy();
   downloads?.destroy();
@@ -292,6 +295,7 @@ async function mountShell(auth: Extract<AuthState, { stage: "ready" }>): Promise
       el("div.toolbar", {}, [tabs]),
       which === "browse" ? browser!.el : downloads!.el
     );
+    if (which === "queue") void refreshJobs();
   };
   tabBrowse.addEventListener("click", () => showPane("browse"));
   tabQueue.addEventListener("click", () => showPane("queue"));
@@ -323,7 +327,6 @@ async function mountShell(auth: Extract<AuthState, { stage: "ready" }>): Promise
 
   await loadChannels(railList);
   addBtn.addEventListener("click", () => promptChannel(railList));
-  await refreshJobs();
 
   // Once, per launch — a banner that reappears on every re-render is noise.
   // It exists to confirm *which* account is connected, which is worth stating
@@ -377,6 +380,7 @@ async function mountShell(auth: Extract<AuthState, { stage: "ready" }>): Promise
     })
   );
 
+  await refreshJobs();
   applyQueueBadge();
 
   /* --- global shortcuts --- */
@@ -746,10 +750,18 @@ function promptChannel(host: HTMLElement): void {
 /* ------------------------------------------------------------------- jobs */
 
 async function refreshJobs(): Promise<void> {
+  const refresh = ++jobsRefresh;
+  const before = new Map(jobs);
   const list = await guard(() => ipc.listJobs());
-  if (!list) return;
+  if (!list || refresh !== jobsRefresh) return;
+
+  const merged = new Map(list.map((job) => [job.id, job]));
+  // Keep state events that arrived while the list request was in flight.
+  for (const [id, job] of jobs) {
+    if (job !== before.get(id)) merged.set(id, job);
+  }
   jobs.clear();
-  for (const j of list) jobs.set(j.id, j);
+  for (const [id, job] of merged) jobs.set(id, job);
   downloads?.render([...jobs.values()]);
   browser?.setJobStates(jobStateIndex());
 }

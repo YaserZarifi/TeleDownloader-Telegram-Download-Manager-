@@ -301,6 +301,16 @@ impl Telegram {
             .ok_or_else(|| anyhow!("Not connected to Telegram."))
     }
 
+    pub(super) async fn account_id(&self) -> Result<i64> {
+        self.inner
+            .lock()
+            .await
+            .user
+            .as_ref()
+            .map(|user| user.id)
+            .ok_or_else(|| anyhow!("Not signed in."))
+    }
+
     pub async fn remember_peer(&self, id: i64, peer: PeerRef, title: &str) {
         let mut inner = self.inner.lock().await;
         inner.peers.insert(id, peer);
